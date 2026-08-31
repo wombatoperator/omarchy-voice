@@ -1,0 +1,14 @@
+# Secrets. .env holds OPENAI_API_KEY — never commit it.
+.env
+.env.*
+*.key
+secrets/
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+
+# Backups the installer/uninstaller leave behind
+*.bak-voice
+*.bak-voice-uninstall

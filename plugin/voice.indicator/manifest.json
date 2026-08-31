@@ -1,0 +1,20 @@
+{
+  "schemaVersion": 1,
+  "id": "voice.indicator",
+  "name": "Voice control",
+  "version": "0.3.0",
+  "author": "omarchy-voice",
+  "description": "Shows whether omarchy-voice is listening, thinking, or acting. Click toggles; click while waiting confirms.",
+  "kinds": [
+    "bar-widget"
+  ],
+  "entryPoints": {
+    "barWidget": "VoiceIndicator.qml"
+  },
+  "barWidget": {
+    "displayName": "Voice control",
+    "description": "Listening state for omarchy-voice",
+    "category": "Audio",
+    "allowMultiple": false
+  }
+}

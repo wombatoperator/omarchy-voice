@@ -1,0 +1,23 @@
+#!/bin/bash
+
+# omarchy:summary=Run one request as if it had been spoken
+# omarchy:group=voice
+# omarchy:args=<request...>
+# omarchy:examples=omarchy voice say "switch to workspace 4"
+
+# One executable per route with its metadata in comments, the shape
+# `omarchy commands` expects. The implementation is the omarchy_voice Python
+# package; these exist so voice control is reachable as `omarchy voice ...`
+# alongside everything else.
+#
+# Never `exec omarchy-voice`: the wrapper for the bare `omarchy voice` route
+# is itself named omarchy-voice, so a PATH lookup would find this file again.
+
+set -euo pipefail
+
+# Set when the add-on is installed under $HOME rather than packaged. Absent,
+# omarchy_voice is expected to be importable already.
+SRC="${OMARCHY_VOICE_SRC:-$HOME/.local/share/omarchy-voice/src}"
+[[ -d $SRC ]] && export PYTHONPATH="$SRC${PYTHONPATH:+:$PYTHONPATH}"
+
+exec python3 -m omarchy_voice say "$@"

@@ -1,0 +1,17 @@
+-- omarchy-voice — add to ~/.config/hypr/bindings.lua
+--
+-- One key, one meaning: SUPER + SHIFT + V turns listening on, and turns it
+-- off again. There is no hold-to-talk and no always-on mode. While it is on,
+-- room audio streams to the API and the bar widget says so; while it is off,
+-- no recorder is running at all.
+--
+-- Deliberately avoids SUPER + V and SUPER + CTRL + V: Omarchy binds those to
+-- Universal paste and the clipboard manager. SUPER + SHIFT + V is free.
+-- Voxtype owns F9 (dictation — speech becomes text); this is the other half,
+-- speech becomes actions.
+
+if o.cmd_present("omarchy-voice") then
+  o.bind("SUPER + SHIFT + V", "Toggle voice control", "omarchy-voice listen toggle")
+  -- While the bar shows "waiting for confirmation", click the widget or:
+  -- o.bind("SUPER + SHIFT + Y", "Confirm voice action", "omarchy-voice listen confirm")
+end

@@ -1,0 +1,31 @@
+[Unit]
+Description=omarchy-voice — voice control for Omarchy
+Documentation=https://omarchy.org
+PartOf=graphical-session.target
+After=graphical-session.target
+# A missing python-websockets or API key is not a transient fault: without
+# the rate limit the daemon restarts every 3 s forever and floods the journal.
+StartLimitIntervalSec=60
+StartLimitBurst=3
+
+[Service]
+Type=simple
+ExecStart=%h/.local/share/omarchy-voice/bin/omarchy-voice run
+# A key exported in your shell does not reach a systemd user unit. Put
+# OPENAI_API_KEY in ~/.config/omarchy-voice/env — one KEY=value per line,
+# chmod 600. The installer creates that file empty.
+EnvironmentFile=-%h/.config/omarchy-voice/env
+# Unexpected disconnects (idle timeout, PipeWire death) return non-zero so
+# this restarts them. `listen quit` and SIGINT return 0 and stay down.
+Restart=on-failure
+RestartSec=3
+PrivateTmp=true
+ProtectSystem=strict
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+NoNewPrivileges=true
+
+[Install]
+WantedBy=graphical-session.target

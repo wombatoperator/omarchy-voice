@@ -1,0 +1,739 @@
+<title>omarchy-voice</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Chivo:wght@400;700;900&family=IBM+Plex+Mono:wght@400;500;600&family=IBM+Plex+Sans:wght@400;500;600&display=swap">
+
+<style>
+  /* ---- tokens: light is the base, both dark states redefine only these ---- */
+  :root {
+    --ground:      #E6E9ED;
+    --surface:     #F7F8FA;
+    --surface-2:   #DDE2E8;
+    --line:        #C3CBD4;
+    --line-soft:   #D6DCE3;
+    --ink:         #131A22;
+    --ink-soft:    #4E5A67;
+    --ink-faint:   #78848F;
+    --accent:      #B4761A;   /* sodium amber, darkened for light ground */
+    --accent-soft: #F0E0C4;
+    --signal:      #2F726D;   /* teal: the offline / local path */
+    --alert:       #A9412C;
+    --shadow:      0 1px 0 rgba(19,26,34,.06), 0 12px 28px -20px rgba(19,26,34,.35);
+    --trace-bg:    #131A22;
+    --trace-ink:   #D9E1E9;
+    --trace-faint: #6C7A87;
+
+    --step: clamp(1.6rem, 3.4vw, 2.6rem);
+    color-scheme: light dark;
+  }
+
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --ground:      #0E141B;
+      --surface:     #161E28;
+      --surface-2:   #1E2833;
+      --line:        #2C3844;
+      --line-soft:   #232E39;
+      --ink:         #DCE3EA;
+      --ink-soft:    #9AA7B4;
+      --ink-faint:   #6E7C89;
+      --accent:      #E9A13B;
+      --accent-soft: #33261140;
+      --signal:      #6BB5AF;
+      --alert:       #D96D53;
+      --shadow:      0 1px 0 rgba(0,0,0,.4), 0 18px 40px -26px rgba(0,0,0,.9);
+      --trace-bg:    #0A0F15;
+      --trace-ink:   #D9E1E9;
+      --trace-faint: #5D6B78;
+    }
+  }
+
+  :root[data-theme="dark"] {
+    --ground:      #0E141B;
+    --surface:     #161E28;
+    --surface-2:   #1E2833;
+    --line:        #2C3844;
+    --line-soft:   #232E39;
+    --ink:         #DCE3EA;
+    --ink-soft:    #9AA7B4;
+    --ink-faint:   #6E7C89;
+    --accent:      #E9A13B;
+    --accent-soft: #33261140;
+    --signal:      #6BB5AF;
+    --alert:       #D96D53;
+    --shadow:      0 1px 0 rgba(0,0,0,.4), 0 18px 40px -26px rgba(0,0,0,.9);
+    --trace-bg:    #0A0F15;
+    --trace-ink:   #D9E1E9;
+    --trace-faint: #5D6B78;
+  }
+
+  /* ---- base ---- */
+  body {
+    background: var(--ground);
+    color: var(--ink);
+    font-family: "IBM Plex Sans", ui-sans-serif, system-ui, sans-serif;
+    font-size: 16px;
+    line-height: 1.6;
+    -webkit-font-smoothing: antialiased;
+  }
+
+  .wrap {
+    max-width: 66rem;
+    margin: 0 auto;
+    padding: clamp(1.4rem, 4vw, 3.5rem) clamp(1.1rem, 4vw, 2.5rem) 5rem;
+  }
+
+  h1, h2, h3 {
+    font-family: Chivo, "IBM Plex Sans", sans-serif;
+    text-wrap: balance;
+    margin: 0;
+  }
+
+  a { color: var(--accent); text-decoration-thickness: 1px; text-underline-offset: 2px; }
+  a:focus-visible, button:focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: 3px;
+    border-radius: 2px;
+  }
+
+  code, .mono { font-family: "IBM Plex Mono", ui-monospace, monospace; }
+
+  .label {
+    font-family: "IBM Plex Mono", monospace;
+    font-size: .68rem;
+    font-weight: 600;
+    letter-spacing: .16em;
+    text-transform: uppercase;
+    color: var(--ink-faint);
+  }
+
+  /* ---- masthead ---- */
+  header.masthead {
+    border-top: 3px solid var(--ink);
+    padding-top: 1.1rem;
+    display: flex;
+    flex-direction: column;
+    gap: 1.1rem;
+  }
+
+  .eyebrow {
+    display: flex;
+    flex-wrap: wrap;
+    gap: .6rem 1.4rem;
+    align-items: baseline;
+  }
+
+  h1 {
+    font-size: clamp(2.7rem, 9vw, 5.4rem);
+    font-weight: 900;
+    letter-spacing: -.035em;
+    line-height: .92;
+  }
+  h1 .dim { color: var(--ink-faint); }
+
+  .thesis {
+    font-size: clamp(1.05rem, 2.1vw, 1.3rem);
+    color: var(--ink-soft);
+    max-width: 40ch;
+    line-height: 1.5;
+  }
+  .thesis strong { color: var(--ink); font-weight: 600; }
+
+  .spec {
+    display: flex;
+    flex-wrap: wrap;
+    gap: .4rem .5rem;
+    padding-top: .3rem;
+  }
+  .chip {
+    font-family: "IBM Plex Mono", monospace;
+    font-size: .72rem;
+    letter-spacing: .02em;
+    padding: .22rem .55rem;
+    border: 1px solid var(--line);
+    border-radius: 2px;
+    color: var(--ink-soft);
+    background: var(--surface);
+  }
+  .chip.on { border-color: var(--signal); color: var(--signal); }
+
+  /* ---- sections ---- */
+  section { margin-top: clamp(3rem, 7vw, 5rem); }
+
+  .sec-head {
+    display: flex;
+    align-items: baseline;
+    gap: 1rem;
+    border-bottom: 1px solid var(--line);
+    padding-bottom: .6rem;
+    margin-bottom: 1.6rem;
+  }
+  .sec-head h2 {
+    font-size: clamp(1.25rem, 2.6vw, 1.7rem);
+    font-weight: 700;
+    letter-spacing: -.015em;
+  }
+  .sec-head .label { margin-left: auto; white-space: nowrap; }
+
+  p { margin: 0 0 1rem; max-width: 68ch; }
+  p:last-child { margin-bottom: 0; }
+  .lede { font-size: 1.06rem; color: var(--ink-soft); }
+
+  /* ---- the trace: the hero object ---- */
+  .trace {
+    background: var(--trace-bg);
+    border: 1px solid var(--line);
+    border-radius: 3px;
+    box-shadow: var(--shadow);
+    overflow: hidden;
+  }
+  .trace-bar {
+    display: flex;
+    align-items: center;
+    gap: .7rem;
+    padding: .5rem .85rem;
+    border-bottom: 1px solid #ffffff14;
+    background: #ffffff08;
+  }
+  .trace-bar .label { color: var(--trace-faint); }
+  .trace-bar .elapsed { margin-left: auto; color: var(--trace-faint); font-family: "IBM Plex Mono", monospace; font-size: .72rem; }
+
+  .trace-body {
+    padding: 1rem .85rem 1.15rem;
+    font-family: "IBM Plex Mono", monospace;
+    font-size: clamp(.74rem, 1.55vw, .88rem);
+    line-height: 1.85;
+    color: var(--trace-ink);
+    overflow-x: auto;
+  }
+  .trace-row {
+    display: grid;
+    grid-template-columns: 5.2rem 1fr;
+    gap: .8rem;
+    align-items: start;
+    white-space: pre-wrap;
+    word-break: break-word;
+  }
+  .trace-row + .trace-row { margin-top: .1rem; }
+  .trace-row .k {
+    color: var(--trace-faint);
+    font-size: .7rem;
+    letter-spacing: .12em;
+    text-transform: uppercase;
+    padding-top: .35em;
+  }
+  .trace-row.heard .v { color: #fff; }
+  .trace-row.act .v { color: var(--accent); }
+  .trace-row.reply .v { color: var(--signal); }
+  .trace-row.held .v { color: var(--alert); }
+
+  .step-in { animation: stepIn .34s cubic-bezier(.2,.7,.3,1) both; }
+  @keyframes stepIn {
+    from { opacity: 0; transform: translateY(4px); }
+    to   { opacity: 1; transform: none; }
+  }
+  @media (prefers-reduced-motion: reduce) {
+    .step-in { animation: none; }
+  }
+
+  .caption {
+    font-size: .85rem;
+    color: var(--ink-faint);
+    margin-top: .7rem;
+    max-width: 60ch;
+  }
+
+  /* ---- chain ---- */
+  .chain {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(9.5rem, 1fr));
+    gap: 1px;
+    background: var(--line);
+    border: 1px solid var(--line);
+    border-radius: 3px;
+    overflow: hidden;
+  }
+  .stage {
+    background: var(--surface);
+    padding: .95rem .9rem 1.05rem;
+    display: flex;
+    flex-direction: column;
+    gap: .35rem;
+  }
+  .stage .n {
+    font-family: "IBM Plex Mono", monospace;
+    font-size: .68rem;
+    letter-spacing: .14em;
+    color: var(--ink-faint);
+  }
+  .stage h3 { font-size: 1rem; font-weight: 700; letter-spacing: -.01em; }
+  .stage p { font-size: .84rem; color: var(--ink-soft); margin: 0; }
+  .stage.local { border-top: 2px solid var(--signal); }
+  .stage.remote { border-top: 2px solid var(--accent); }
+
+  /* ---- tables ---- */
+  .table-scroll { overflow-x: auto; border: 1px solid var(--line); border-radius: 3px; background: var(--surface); }
+  table { border-collapse: collapse; width: 100%; font-size: .88rem; }
+  th, td { text-align: left; padding: .6rem .8rem; border-bottom: 1px solid var(--line-soft); vertical-align: top; }
+  thead th {
+    font-family: "IBM Plex Mono", monospace;
+    font-size: .68rem;
+    letter-spacing: .13em;
+    text-transform: uppercase;
+    color: var(--ink-faint);
+    font-weight: 600;
+    background: var(--surface-2);
+    border-bottom: 1px solid var(--line);
+  }
+  tbody tr:last-child td { border-bottom: 0; }
+  td code { font-size: .82em; color: var(--ink); background: var(--surface-2); padding: .08em .35em; border-radius: 2px; }
+
+  .verdict { font-family: "IBM Plex Mono", monospace; font-size: .72rem; font-weight: 600; letter-spacing: .08em; white-space: nowrap; }
+  .verdict.run  { color: var(--signal); }
+  .verdict.hold { color: var(--accent); }
+  .verdict.no   { color: var(--alert); }
+
+  /* ---- two-up ---- */
+  .two-up {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(17rem, 1fr));
+    gap: clamp(1rem, 2.5vw, 2rem);
+  }
+
+  .card {
+    background: var(--surface);
+    border: 1px solid var(--line);
+    border-radius: 3px;
+    padding: 1.1rem 1.1rem 1.2rem;
+  }
+  .card h3 { font-size: 1rem; font-weight: 700; margin-bottom: .45rem; }
+  .card p { font-size: .89rem; color: var(--ink-soft); }
+
+  pre.cmd {
+    background: var(--trace-bg);
+    color: var(--trace-ink);
+    font-family: "IBM Plex Mono", monospace;
+    font-size: .8rem;
+    line-height: 1.75;
+    padding: .9rem 1rem;
+    border-radius: 3px;
+    overflow-x: auto;
+    margin: 0;
+    border: 1px solid var(--line);
+  }
+  pre.cmd .c { color: var(--trace-faint); }
+  pre.cmd .p { color: var(--accent); }
+
+  ul.tight { margin: 0; padding-left: 1.1rem; }
+  ul.tight li { margin-bottom: .4rem; color: var(--ink-soft); font-size: .92rem; }
+  ul.tight li strong { color: var(--ink); font-weight: 600; }
+
+  footer {
+    margin-top: clamp(3rem, 7vw, 5rem);
+    border-top: 1px solid var(--line);
+    padding-top: 1rem;
+    display: flex;
+    flex-wrap: wrap;
+    gap: .6rem 1.4rem;
+    align-items: baseline;
+  }
+</style>
+
+<div class="wrap">
+
+  <header class="masthead">
+    <div class="eyebrow">
+      <span class="label">Omarchy add-on</span>
+      <span class="label" style="color:var(--accent)">v0.3 · working</span>
+    </div>
+
+    <h1>omarchy<span class="dim">-</span>voice</h1>
+
+    <p class="thesis">
+      Operate the desktop by talking to it. Not a phrase list &mdash;
+      <strong>a model that reads your machine's real API off the machine</strong>
+      and drives it with the same dispatchers your keybindings use.
+    </p>
+
+    <div class="spec">
+      <span class="chip">Omarchy 4.0.1</span>
+      <span class="chip">Hyprland 0.56.2</span>
+      <span class="chip on">toggle to talk</span>
+      <span class="chip">8 tools</span>
+      <span class="chip">MIT</span>
+    </div>
+  </header>
+
+  <section aria-labelledby="compose-h">
+    <div class="sec-head">
+      <h2 id="compose-h">Ask for a task, not an application</h2>
+      <span class="label">recorded run</span>
+    </div>
+    <div class="two-up">
+      <div>
+        <pre class="cmd"><span class="p">you</span> what&rsquo;s going on in the news today
+<span class="p">  →</span> compose_windows(columns, workspace &ldquo;next&rdquo;,
+<span class="p">   </span>   [ AP News, Reuters ])
+<span class="p">oma</span> I opened AP News and Reuters side by side
+<span class="p">   </span> in a new workspace.</pre>
+        <p class="caption" style="margin-top:.8rem">
+          Tool call 1.3 s after the sentence ends; both windows up and placed at 10.8 s.
+        </p>
+      </div>
+      <div class="card">
+        <h3>Why this is a tool and not a prompt</h3>
+        <p>A launch command returns before the window exists, so an assistant issuing its
+        own move and focus calls is addressing windows that have not been mapped yet &mdash;
+        every placement races the application it is placing. <code>compose_windows</code>
+        waits for each window to appear, moves it if a window rule sent it elsewhere, then
+        preselects the split for the next one. Whatever did not come up is named in the
+        reply rather than reported as open.</p>
+      </div>
+    </div>
+  </section>
+
+  <section aria-labelledby="trace-h">
+    <div class="sec-head">
+      <h2 id="trace-h">One sentence, four dispatches</h2>
+      <span class="label">recorded run</span>
+    </div>
+
+    <div class="trace" id="hero-trace">
+      <div class="trace-bar">
+        <span class="label">omarchy-voice say</span>
+        <span class="elapsed">6.2 s · dry run</span>
+      </div>
+      <div class="trace-body">
+        <div class="trace-row heard" data-step><span class="k">heard</span><span class="v">close the grok terminal but leave the other one alone, then make what's left full screen</span></div>
+        <div class="trace-row act" data-step><span class="k">action</span><span class="v">hl.dsp.focus({ window = "address:0x563a0c73c2d0" })</span></div>
+        <div class="trace-row act" data-step><span class="k">action</span><span class="v">hl.dsp.window.close()</span></div>
+        <div class="trace-row act" data-step><span class="k">action</span><span class="v">hl.dsp.focus({ window = "address:0x563a0c76eef0" })</span></div>
+        <div class="trace-row act" data-step><span class="k">action</span><span class="v">hl.dsp.window.fullscreen({ mode = "fullscreen" })</span></div>
+        <div class="trace-row reply" data-step><span class="k">reply</span><span class="v">Closed the grok terminal; the other is now fullscreen.</span></div>
+      </div>
+    </div>
+
+    <p class="caption">
+      Both windows were <code>foot</code> terminals on the same workspace. The class name
+      could not tell them apart, so the model queried the window list, matched on title,
+      and targeted by address &mdash; then ordered the four calls so the survivor was the
+      one that went fullscreen.
+    </p>
+  </section>
+
+  <section aria-labelledby="why-h">
+    <div class="sec-head">
+      <h2 id="why-h">Why a model, not a grammar</h2>
+      <span class="label">the argument</span>
+    </div>
+    <p class="lede">
+      Every phrase-grammar voice tool ends up with a wiki page of exact incantations, and
+      &ldquo;switch me to the workspace with the browser on it&rdquo; is never on it. The
+      grammar makes you learn its vocabulary instead of the other way round.
+    </p>
+    <p>
+      But handing a model a microphone is only interesting if it knows what it is holding.
+      The part of this add-on that actually matters is not the API call &mdash; it is what
+      the model is told before the call.
+    </p>
+  </section>
+
+  <section aria-labelledby="manifest-h">
+    <div class="sec-head">
+      <h2 id="manifest-h">It reads the machine, not a manual</h2>
+      <span class="label">21,771 chars, rebuilt on update</span>
+    </div>
+
+    <p>
+      On first run <code>omarchy-voice</code> compiles a capability manifest from four live
+      sources. Nothing about the desktop API is hardcoded, so the assistant is correct for
+      <em>your</em> Hyprland and <em>your</em> Omarchy &mdash; and stays correct after an
+      update, with nothing to re-teach.
+    </p>
+
+    <div class="table-scroll">
+      <table>
+        <thead>
+          <tr><th>Source on this machine</th><th>What it contributes</th></tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td><code>/usr/share/hypr/stubs/hl.meta.lua</code></td>
+            <td>Every dispatcher, read from Hyprland's own type stub &mdash; cursor, window, workspace, group namespaces</td>
+          </tr>
+          <tr>
+            <td><code>default/hypr/bindings/*.lua</code></td>
+            <td>Real call syntax, verified by the fact that your desktop binds it to keys right now</td>
+          </tr>
+          <tr>
+            <td><code>omarchy commands --json</code></td>
+            <td>The whole CLI with arguments and summaries; hidden and sudo-requiring commands filtered out</td>
+          </tr>
+          <tr>
+            <td><code>hyprctl -j</code> + <code>.desktop</code> files</td>
+            <td>Your monitors, workspaces, open windows and installed apps &mdash; refreshed every request</td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+
+    <p class="caption">
+      This is load-bearing. Hyprland 0.56 moved to a Lua dispatch API: <code>hyprctl dispatch
+      workspace 1</code> is dead, and a model working from memory writes it anyway. Reading the
+      stub means it writes <code>hl.dsp.focus({ workspace = "1" })</code> instead.
+      <code>omarchy-voice manifest</code> prints exactly what it knows.
+    </p>
+  </section>
+
+  <section aria-labelledby="chain-h">
+    <div class="sec-head">
+      <h2 id="chain-h">The signal chain</h2>
+      <span class="label">teal = stays on the machine</span>
+    </div>
+
+    <div class="chain">
+      <div class="stage local">
+        <span class="n">01 · LOCAL</span>
+        <h3>Toggle</h3>
+        <p>SUPER + SHIFT + V. Until it is on there is no recorder process at all.</p>
+      </div>
+      <div class="stage local">
+        <span class="n">02 · LOCAL</span>
+        <h3>Microphone</h3>
+        <p>pw-record off PipeWire, 24 kHz mono, in 100 ms frames.</p>
+      </div>
+      <div class="stage remote">
+        <span class="n">03 · OPENAI</span>
+        <h3>Realtime</h3>
+        <p>Audio streams to gpt-realtime while listening is on. No local transcription step.</p>
+      </div>
+      <div class="stage remote">
+        <span class="n">04 · OPENAI</span>
+        <h3>Decide</h3>
+        <p>Persona, the capability manifest, and a desktop snapshot refreshed every turn.</p>
+      </div>
+      <div class="stage local">
+        <span class="n">05 · LOCAL</span>
+        <h3>Policy gate</h3>
+        <p>Every call checked before it runs. Denied, held, or allowed.</p>
+      </div>
+      <div class="stage local">
+        <span class="n">06 · LOCAL</span>
+        <h3>Act</h3>
+        <p>hyprctl · omarchy · wtype · uwsm-app, then a notification and bar state.</p>
+      </div>
+    </div>
+
+    <p class="caption">
+      <strong>While listening is on, room audio streams continuously to OpenAI.</strong>
+      There is no local recognition step and no wake word to hold it back &mdash; the gate
+      is the toggle, and it is the whole gate. Off, no <code>pw-record</code> is running,
+      so there is nothing being captured and discarded. That is the trade the speed is
+      bought with, and it is the first thing to know about this program.
+    </p>
+  </section>
+
+  <section aria-labelledby="safety-h">
+    <div class="sec-head">
+      <h2 id="safety-h">An open microphone is untrusted input</h2>
+      <span class="label">12 deny · 13 confirm rules</span>
+    </div>
+
+    <p>
+      A television in the room, a person on a call, a mis-transcription &mdash; any of them can
+      put a sentence into this pipeline. So the model's decisions are checked before they run,
+      by rules the model cannot reach or rewrite.
+    </p>
+
+    <div class="table-scroll">
+      <table>
+        <thead>
+          <tr><th style="width:6.5rem">Verdict</th><th>Covers</th><th>Behaviour</th></tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td><span class="verdict no">DENIED</span></td>
+            <td><code>rm -rf</code>, <code>dd</code>, <code>mkfs</code>, <code>sudo</code>, <code>pkexec</code>, <code>ssh</code>, <code>passwd</code>, curl-piped-to-shell, <code>git push</code></td>
+            <td>Never runs, whatever the model asks for. Deny beats confirm.</td>
+          </tr>
+          <tr>
+            <td><span class="verdict hold">HELD</span></td>
+            <td>shutdown, reboot, suspend, package installs, <code>omarchy update</code>, config resets, close-all-windows</td>
+            <td>Stops and waits for you to say &ldquo;confirm&rdquo; out loud.</td>
+          </tr>
+          <tr>
+            <td><span class="verdict run">ALLOWED</span></td>
+            <td>Window, workspace, monitor, theme, audio, brightness, screenshots, launching apps, app shortcuts</td>
+            <td>Runs immediately. You asked out loud; that is the permission.</td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+
+    <div class="trace" style="margin-top:1.2rem">
+      <div class="trace-bar">
+        <span class="label">the hold, in practice</span>
+        <span class="elapsed">4.3 s</span>
+      </div>
+      <div class="trace-body">
+        <div class="trace-row heard"><span class="k">heard</span><span class="v">reboot the machine</span></div>
+        <div class="trace-row held"><span class="k">held</span><span class="v">systemctl reboot</span></div>
+        <div class="trace-row reply"><span class="k">reply</span><span class="v">Say confirm to systemctl reboot</span></div>
+      </div>
+    </div>
+
+    <p class="caption">
+      Note the reply. The model had already narrated the reboot as done; the gate rewrote what
+      you hear so it matches what actually happened. An assistant that says
+      &ldquo;shutting down now&rdquo; and then doesn't is worse than one that refuses.
+    </p>
+
+    <p style="margin-top:1.1rem">
+      The shell tool is off by default &mdash; the model gets no arbitrary command execution
+      unless you turn it on and accept what that means. Everything heard, decided and run is
+      logged. The systemd unit runs under <code>ProtectSystem=strict</code> with a read-only
+      home and three writable paths.
+    </p>
+  </section>
+
+  <section aria-labelledby="try-h">
+    <div class="sec-head">
+      <h2 id="try-h">Try it without a microphone</h2>
+      <span class="label">the honest demo path</span>
+    </div>
+
+    <p>
+      <code>say</code> exercises the entire pipeline except the microphone, so you can watch
+      what a sentence turns into before you trust it with an open mic. Add
+      <code>--dry-run</code> and it decides but narrates instead of acting.
+    </p>
+
+    <div class="two-up">
+      <div>
+        <pre class="cmd"><span class="c"># the whole pipeline, minus the mic</span>
+<span class="p">$</span> omarchy-voice say "what windows do I have open"
+<span class="c">reply   Two foot terminals on workspace 1: the
+        voice navigation addon and a grok session.</span>
+
+<span class="p">$</span> omarchy-voice say "switch to workspace four"
+<span class="c">action  hl.dsp.focus({ workspace = "4" })
+reply   Switched to workspace 4.</span></pre>
+      </div>
+      <div>
+        <pre class="cmd"><span class="c"># check every moving part</span>
+<span class="p">$</span> omarchy-voice doctor
+
+<span class="c"># what the model knows about this machine</span>
+<span class="p">$</span> omarchy-voice manifest
+
+<span class="c"># decide, but touch nothing</span>
+<span class="p">$</span> omarchy-voice --dry-run say "..."
+
+<span class="c"># everything it heard and did</span>
+<span class="p">$</span> omarchy-voice log -f</pre>
+      </div>
+    </div>
+  </section>
+
+  <section aria-labelledby="status-h">
+    <div class="sec-head">
+      <h2 id="status-h">What is proven, and what isn't</h2>
+      <span class="label">v0.3 honesty</span>
+    </div>
+
+    <div class="table-scroll">
+      <table>
+        <thead>
+          <tr><th style="width:8rem">Status</th><th>Component</th></tr>
+        </thead>
+        <tbody>
+          <tr><td><span class="verdict run">VERIFIED</span></td><td>End-to-end sentence &rarr; dispatch &rarr; real desktop change, on Omarchy 4.0.1 / Hyprland 0.56.2</td></tr>
+          <tr><td><span class="verdict run">VERIFIED</span></td><td>Window disambiguation by title and address; multi-step ordering</td></tr>
+          <tr><td><span class="verdict run">VERIFIED</span></td><td>Policy gate &mdash; 113 unit tests over deny, hold, confirm-then-run, deny-beats-confirm, and the composition path</td></tr>
+          <tr><td><span class="verdict run">VERIFIED</span></td><td>The microphone path, on a USB interface, spoken end to end</td></tr>
+          <tr><td><span class="verdict run">VERIFIED</span></td><td>Window composition &mdash; <code>columns</code>, <code>main-and-side</code> and <code>grid</code>, measured on a 2560&times;1080 monitor: three equal columns land at 845/829/834 px in 2.0 s</td></tr>
+          <tr><td><span class="verdict run">VERIFIED</span></td><td>The <code>omarchy voice &hellip;</code> routes, resolved against Omarchy&rsquo;s own dispatcher</td></tr>
+          <tr><td><span class="verdict hold">KNOWN LIMIT</span></td><td>The API&rsquo;s tokens-per-minute budget. About 8,200 tokens a turn against a 40,000 TPM tier is roughly five turns a minute; past that the daemon waits the interval the server names and retries rather than going silent</td></tr>
+          <tr><td><span class="verdict hold">UNTESTED</span></td><td>The bar widget QML, which needs a running Omarchy shell to exercise</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <p class="caption">
+      Measured on the realtime path: a tool call lands about 1.3 s after you stop speaking,
+      and a three-pane workspace is built and placed in about 2 s. The manifest and persona sit
+      in the cached prefix; the desktop snapshot is appended per turn and the stale one deleted,
+      so the cache survives a desktop that keeps changing.
+    </p>
+  </section>
+
+  <section aria-labelledby="install-h">
+    <div class="sec-head">
+      <h2 id="install-h">Install</h2>
+      <span class="label">idempotent, asks first</span>
+    </div>
+
+    <div class="two-up">
+      <div>
+        <pre class="cmd"><span class="p">$</span> git clone …/omarchy-voice
+<span class="p">$</span> cd omarchy-voice
+<span class="p">$</span> ./install.sh
+<span class="p">$</span> omarchy-voice doctor</pre>
+        <p class="caption" style="margin-top:.8rem">
+          The installer offers the keybinding, the bar widget, the user service, and the
+          <code>omarchy voice &hellip;</code> routes, asking before each. It runs without an API
+          key &mdash; the bar just says it needs configuring.
+        </p>
+      </div>
+      <div class="card">
+        <h3>Next, and deliberately absent</h3>
+        <ul class="tight">
+          <li><strong>Clicking.</strong> Hyprland moves the cursor but has no click dispatcher, so pointer clicks need <code>ydotool</code>. Everything here works without it, by driving apps through their own shortcuts &mdash; faster anyway. A grid overlay is the obvious next piece.</li>
+          <li><strong>Speaker identification.</strong> It answers to any voice in the room.</li>
+          <li><strong>A second provider.</strong> Speech-to-speech realtime is OpenAI and Gemini Live and not much else, both paid and proprietary, so an abstraction layer buys almost no coverage. <code>realtime.py</code> is the seam if that changes.</li>
+        </ul>
+      </div>
+    </div>
+  </section>
+
+  <section aria-labelledby="pair-h">
+    <div class="sec-head">
+      <h2 id="pair-h">Next to Voxtype, not instead of it</h2>
+      <span class="label">the pair</span>
+    </div>
+    <div class="two-up">
+      <div class="card">
+        <h3>Voxtype &mdash; F9</h3>
+        <p>Ships with Omarchy. Speech becomes <strong>text</strong>: it types what you said into the focused window.</p>
+      </div>
+      <div class="card" style="border-color:var(--accent)">
+        <h3>omarchy-voice &mdash; SUPER + SHIFT + V</h3>
+        <p>This. Speech becomes <strong>actions</strong>: it operates the desktop instead of typing into it.</p>
+      </div>
+    </div>
+  </section>
+
+  <footer>
+    <span class="label">omarchy-voice v0.3</span>
+    <span class="label">MIT</span>
+    <span class="label" style="margin-left:auto">built and measured on Omarchy 4.0.1</span>
+  </footer>
+
+</div>
+
+<script>
+  // Reveal the hero trace one line at a time — the sentence arriving, then each
+  // dispatch firing. Static for anyone who asked for less motion.
+  (function () {
+    var reduce = window.matchMedia("(prefers-reduced-motion: reduce)");
+    var rows = document.querySelectorAll("#hero-trace [data-step]");
+    if (reduce.matches || !rows.length) return;
+    rows.forEach(function (row, i) {
+      row.style.visibility = "hidden";
+      window.setTimeout(function () {
+        row.style.visibility = "";
+        row.classList.add("step-in");
+      }, 260 + i * 190);
+    });
+  })();
+</script>

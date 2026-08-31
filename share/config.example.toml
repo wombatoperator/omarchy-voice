@@ -1,0 +1,43 @@
+# ~/.config/omarchy-voice/config.toml
+# Every key here is optional — these are the defaults.
+
+[openai]
+# Used by `omarchy-voice say` (typed, no microphone). The daemon itself talks
+# to the Realtime API; this is the Chat Completions model for one-shot plans.
+planner_model = "gpt-4.1"
+api_key_env = "OPENAI_API_KEY"
+max_turns = 8
+
+[ears]
+# Listening always starts off. SUPER + SHIFT + V, or the bar widget, turns it
+# on and off again — there is no always-on mode and no hold-to-talk. Muting
+# stops the recorder rather than capturing and discarding, so nothing is
+# picked up while it is off.
+# device = "alsa_input.pci-0000_00_1f.3.analog-stereo"   # pin a specific mic
+
+[realtime]
+model = "gpt-realtime-2.1"
+voice = "marin"           # cannot be changed once a session has spoken
+turn_detection = "semantic_vad"   # semantic_vad | server_vad | none
+sample_rate = 24000
+# `none` commits the audio buffer when you toggle listening off, then asks
+# for a response. Toggling off stops the recorder, so nothing is captured.
+
+[hands]
+# The shell tool is off by default. On, the model can run arbitrary commands —
+# which is exactly as large a hole as it sounds, on an open microphone.
+allow_shell = false
+confirm_words = ["confirm", "yes do it", "go ahead"]
+cancel_words = ["cancel", "never mind", "nevermind"]
+
+# Extra patterns are *added* to the built-in list. Set the matching
+# `*_replace = true` if you want to throw the defaults away.
+# confirm_patterns = ["\\bshutdown\\b"]
+# confirm_patterns_replace = false
+# deny_patterns = ["\\bssh\\b"]
+# deny_patterns_replace = false
+
+[mouth]
+notify = true
+speak  = false            # needs piper or espeak-ng
+# tts_command = "piper-say"

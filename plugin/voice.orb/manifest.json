@@ -1,0 +1,15 @@
+{
+  "schemaVersion": 1,
+  "id": "voice.orb",
+  "name": "Voice orb",
+  "version": "0.3.0",
+  "author": "omarchy-voice",
+  "description": "A themed orb at the bottom of the screen while voice control is listening.",
+  "kinds": [
+    "panel"
+  ],
+  "keepLoaded": true,
+  "entryPoints": {
+    "panel": "VoiceOrb.qml"
+  }
+}
