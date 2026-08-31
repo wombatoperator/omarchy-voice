@@ -1,6 +1,6 @@
 # omarchy-voice — 0.3.0
 
-**Status as of 2026-08-31.** 154 tests passing. Published at
+**Status as of 2026-08-31.** 158 tests passing. Published at
 <https://github.com/wombatoperator/omarchy-voice> (MIT, public).
 
 ## Where things stand
@@ -10,7 +10,7 @@
 | Daemon | running as a systemd user service, `gpt-realtime-2.1` |
 | Prompt | ~6,900 tokens a turn, down from 9,350 |
 | Tests | 154 |
-| Clicking | built and unit-tested; **blocked** on ydotool, see below |
+| Clicking | working end to end, verified against a live browser |
 
 ### Open pull requests to Omarchy
 
@@ -28,22 +28,39 @@
 Neither is a prerequisite for anything here. Both stay on the public record
 whether or not they merge.
 
-### Blocked: clicking
+### Clicking
 
-`click_text` is written and unit-tested but has never run end to end, because
-`ydotool` cannot open `/dev/uinput`. The package ships the rule that fixes it and
-the user is already in the `input` group; udev has just never applied it, and the
-`uinput` module is not loaded:
+Works. `ydotool` needed `/dev/uinput` group access, which its own packaged udev
+rule grants — the `uinput` module simply was not loaded and udev had never
+applied the rule. Arch ships a **user** service called `ydotool`, not a root
+`ydotoold`.
 
 ```bash
 sudo modprobe uinput
-sudo udevadm control --reload-rules
-sudo udevadm trigger --name-match=uinput
-systemctl --user restart ydotool
+sudo udevadm control --reload-rules && sudo udevadm trigger --name-match=uinput
+systemctl --user enable --now ydotool
 ```
 
-`/dev/uinput` should then be `crw-rw---- root:input`. Note Arch ships a **user**
-service called `ydotool`, not a root `ydotoold`.
+Two bugs only showed up once it could actually run, both of which made it click
+confidently in the wrong place:
+
+* tesseract was on `--psm 6`, "one uniform block of text", inherited from
+  `omarchy-capture-text` where a human has dragged a box around a paragraph. A
+  screen is not that, and psm 6 read straight past the tab row of a GitHub pull
+  request. `--psm 3` finds it.
+* A run qualified on half its words, so a two-word target passed on one: asked
+  for "Files changed" it matched "changed files" in the body prose and clicked
+  there. Every word is required now, with one word of slack for long phrases.
+
+Verified: `click_text("Discussions")` navigated the browser.
+
+**Known limit.** It clicks text that looks like the query, and cannot tell a
+link from prose that happens to read the same. On a text-heavy page, prefer
+wording that appears once, or drive the app with `send_shortcut` instead.
+
+`ydotool mousemove --absolute` lands at twice the requested coordinates on this
+display, so positioning stays with `hl.dsp.cursor.move` and ydotool is only
+asked to press the button.
 
 ## Clicking, and not inventing failures
 
