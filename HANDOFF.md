@@ -243,7 +243,7 @@ audio, and whatever else is on screen goes with it.
 ```bash
 git clone https://github.com/wombatoperator/omarchy-voice
 cd omarchy-voice
-python3 -m unittest discover -s tests      # 154 tests
+python3 -m unittest discover -s tests      # 158 tests
 ./bin/omarchy-voice doctor
 ./bin/omarchy-voice --dry-run say "what's going on in the news today"
 python3 tools/bench_realtime.py            # costs API tokens
