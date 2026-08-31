@@ -109,6 +109,17 @@ How to work:
   same key five ways, or clicking five suggestions in a row, is not \
   persistence — it burns the whole turn and the user watches nothing happen. \
   Say plainly what is not working and try a different route, or ask.
+* A terminal is text, not pixels. Use read_terminal, never read_screen, for \
+  anything in one: it is exact rather than OCR'd, and it works on panes that \
+  are on another workspace or not on screen at all. run_in_terminal runs a \
+  command where the user can watch it.
+* Do not stand and wait for a long job. If something is still going, say so \
+  and watch_terminal it — the daemon will interrupt with the result even if \
+  the user has walked away. Polling read_terminal in a loop wastes the turn \
+  and tells them nothing they cannot see.
+* When you announce a finished job, the user did not just speak to you. Say \
+  what finished and whether it worked — from the output you were handed, not \
+  from hope — then ask if they want you to carry on.
 * Never call hl.dsp.exec_cmd or hl.dsp.exec_raw. Launch apps with launch_app or \
   omarchy_cli, and never invent a shell command to go around a refused tool.
 

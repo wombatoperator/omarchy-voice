@@ -587,3 +587,98 @@ class ReconnectTests(unittest.IsolatedAsyncioTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class AnnounceTests(unittest.IsolatedAsyncioTestCase):
+    """Saying something without being asked.
+
+    Everything else this daemon does is a reply. A build that ends on
+    workspace two is the one thing it starts on its own, and the rules about
+    when it may do that are the interesting part.
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        root = Path(self.tmp.name)
+        for name, value in (("LOG_FILE", root / "session.log"),
+                            ("STATE_FILE", root / "state.json"),
+                            ("STATE_DIR", root),
+                            ("RUNTIME_DIR", root)):
+            patcher = mock.patch.object(feedback, name, value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        self.addCleanup(self.tmp.cleanup)
+        self.session = realtime.RealtimeSession(Config(dry_run=True, notify=False))
+        self.socket = FakeSocket()
+        self.session.ws = self.socket
+        self.session._last_interruption = 0.0
+        self.notified = []
+        patcher = mock.patch.object(self.session.feedback, "notify",
+                                    side_effect=lambda *a, **k: self.notified.append(a))
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def job(self, **over):
+        base = {"target": "Work:1.1", "label": "the test run", "seconds": 42.0,
+                "vanished": False, "timed_out": False, "tail": "ALL TESTS PASSED"}
+        return {**base, **over}
+
+    async def test_a_muted_session_notifies_instead_of_speaking(self):
+        """Talking into a room that is not listening is just noise."""
+        self.session.active = False
+        await self.session._announce(self.job())
+        self.assertEqual(self.socket.sent, [])
+        self.assertTrue(self.notified)
+
+    async def test_a_listening_session_is_asked_to_speak(self):
+        self.session.active = True
+        await self.session._announce(self.job())
+        self.assertTrue(self.socket.events("conversation.item.create"))
+        self.assertTrue(self.socket.events("response.create"))
+
+    async def test_the_output_goes_with_it_so_the_verdict_is_not_guessed(self):
+        self.session.active = True
+        await self.session._announce(self.job(tail="FAILED: 3 tests"))
+        item = self.socket.events("conversation.item.create")[0]["item"]
+        text = item["content"][0]["text"]
+        self.assertIn("FAILED: 3 tests", text)
+        self.assertIn("the test run", text)
+
+    async def test_the_model_is_told_the_user_did_not_just_speak(self):
+        """Without this it answers as though it had been asked something."""
+        self.session.active = True
+        await self.session._announce(self.job())
+        text = self.socket.events("conversation.item.create")[0]["item"]["content"][0]["text"]
+        self.assertIn("did not just speak", text)
+
+    async def test_a_vanished_pane_is_described_as_closed_not_finished(self):
+        self.session.active = True
+        await self.session._announce(self.job(vanished=True))
+        text = self.socket.events("conversation.item.create")[0]["item"]["content"][0]["text"]
+        self.assertIn("closed", text)
+
+    async def test_it_waits_rather_than_talking_over_a_reply_in_flight(self):
+        self.session.active = True
+        self.session._response_running = True
+
+        async def release():
+            await asyncio.sleep(0.05)
+            self.session._response_running = False
+
+        await asyncio.gather(self.session._announce(self.job()), release())
+        self.assertTrue(self.socket.events("response.create"))
+
+    async def test_announcements_do_not_pile_up_on_each_other(self):
+        self.session.active = True
+        self.session._last_interruption = time.time()
+        with mock.patch.object(realtime, "WATCH_MIN_GAP_SECONDS", 0.05):
+            await self.session._announce(self.job())
+        self.assertTrue(self.socket.events("response.create"))
+
+    async def test_a_stopping_session_says_nothing(self):
+        self.session.active = True
+        self.session._stop.set()
+        self.session._response_running = True
+        await self.session._announce(self.job())
+        self.assertEqual(self.socket.events("response.create"), [])
+

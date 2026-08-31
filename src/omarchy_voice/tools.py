@@ -34,7 +34,8 @@ QUERY_KINDS = {
 }
 
 # Read-only tools still run under --dry-run so the planner can see the desktop.
-READ_ONLY_TOOLS = {"hypr_query", "read_screen", "omarchy_help", "system_query"}
+READ_ONLY_TOOLS = {"hypr_query", "read_screen", "omarchy_help", "system_query",
+                   "read_terminal", "list_terminals"}
 
 # Hyprland dispatchers that spawn processes. They bypass allow_shell unless
 # we reject them here.
@@ -132,6 +133,62 @@ def _required_hits(word_count: int) -> int:
     one misread letter is worse than the occasional near-miss.
     """
     return word_count if word_count <= 3 else word_count - 1
+# --- terminals, through tmux ------------------------------------------------
+#
+# A terminal used to be a picture: grim the window, run tesseract, hope. That
+# meant output was garbled, only readable while the window was visible, and
+# impossible to see at all with the screen asleep or the session locked. Input
+# was worse — wtype into whatever happened to have focus, with no way to tell
+# whether it landed.
+#
+# tmux answers all of it at once, and Omarchy already ships it:
+#
+#   capture-pane -p        exact scrollback, from a pane on no workspace at all
+#   pane_current_command   bash -> sleep -> bash: "is it finished", for free
+#   send-keys              input with no focus, no keysym, no window target
+#   list-panes -a          structured state across every session
+#
+# `Work` is the session `omarchy launch terminal tmux` attaches to
+# (`tmux attach || tmux new -s Work`), so this shares the terminal the user
+# already has rather than hiding one away.
+TMUX_SESSION = "Work"
+# Window classes that are a terminal. Used to answer "can the user actually see
+# this?", because tmux's own `session_attached` cannot: a session is equally
+# "attached" whether its client is on the workspace in front of you or on one
+# you left an hour ago. Substring-matched, so ghostty's reverse-DNS class and
+# wezterm's both land.
+TERMINAL_CLASSES = ("foot", "alacritty", "kitty", "ghostty", "wezterm",
+                    "term", "console")
+# What `pane_current_command` says when nothing is running but the shell. A
+# pane sitting at one of these is idle; anything else is a running command.
+IDLE_COMMANDS = {"bash", "zsh", "fish", "sh", "dash", "ksh", "nu", "elvish"}
+# Scrollback handed back for a read. Generous — this is exact text rather than
+# OCR, and the per-minute budget is no longer the binding constraint it was.
+TERMINAL_LINES = 200
+TERMINAL_OUTPUT_LIMIT = 6000
+# How long `run_in_terminal` waits for a quick command before handing back
+# "still running" and watching it instead. Long enough for a git status or a
+# test run that was going to be fast; short enough not to hold the microphone.
+TERMINAL_QUICK_WAIT = 6.0
+TERMINAL_POLL = 0.2
+# How long to allow for a pane to *start* looking busy after keys are sent.
+# `pane_current_command` does not update the instant send-keys returns — the
+# shell has not forked yet — so the first poll sees "bash" and, without this, a
+# twenty-second command was reported finished in 0.4s with the echoed command
+# line handed back as its output. A command that never looks busy inside this
+# window really was instant, or was a shell builtin like `cd` that never forks.
+#
+# Measured rather than guessed: tmux reflected the forked command in 0.024s,
+# six times out of six. This is 25x that, and it is the floor on how long an
+# instant command appears to take, so it is not worth being generous with —
+# 2.5s here meant `echo hello` sat silent for nearly three seconds.
+TERMINAL_START_GRACE = 0.6
+# How long to give a freshly launched terminal to attach to the session.
+TERMINAL_ATTACH_TIMEOUT = 12.0
+# A watch that never finishes would sit in the registry forever. Nothing takes
+# longer than this that the user would still want announced out of the blue.
+WATCH_MAX_SECONDS = 3 * 60 * 60
+
 # --- searching the web ------------------------------------------------------
 #
 # The query goes in the URL. Nothing is typed.
@@ -521,6 +578,74 @@ TOOL_SCHEMAS = [
                          "description": "Read the page once it loads. Default true."},
             },
             "required": ["url"],
+            "additionalProperties": False,
+        },
+    },
+    {
+        "name": "read_terminal",
+        "description": (
+            "Read a terminal's output as EXACT text, through tmux. Use this instead of "
+            "read_screen for anything in a terminal: it is not OCR, it works on panes "
+            "that are on another workspace or not on screen at all, and it works with "
+            "the display asleep. Empty target picks the pane with something running in "
+            "it. Tells you whether the pane is idle or still busy."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "target": {"type": "string",
+                           "description": 'A tmux target like "Work:1.1", or empty for the '
+                                          "most interesting pane. list_terminals shows them."},
+                "lines": {"type": "integer", "description": "Scrollback lines. Default 200."},
+            },
+            "additionalProperties": False,
+        },
+    },
+    {
+        "name": "list_terminals",
+        "description": (
+            "What tmux panes exist, what each is running, and whether anyone can see "
+            "them. Call it when the user says \"the terminal\" and more than one is open, "
+            "or to find something that is still going."
+        ),
+        "input_schema": {"type": "object", "properties": {}, "additionalProperties": False},
+    },
+    {
+        "name": "run_in_terminal",
+        "description": (
+            "Run a shell command in a terminal the user can see, and read what it "
+            "printed. Goes through tmux, so it needs no focus and no keypresses. Only "
+            "runs in panes that are on screen — never a hidden one — and opens a "
+            "terminal if none is up. A command still going after a few seconds is left "
+            "running and watched; you are told, and should say so and move on rather "
+            "than waiting."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "command": {"type": "string", "description": "One shell command."},
+                "target": {"type": "string",
+                           "description": "Optional tmux target. Empty picks a visible idle pane."},
+            },
+            "required": ["command"],
+            "additionalProperties": False,
+        },
+    },
+    {
+        "name": "watch_terminal",
+        "description": (
+            "Tell me when the command in a pane finishes. Returns immediately — the "
+            "daemon watches in the background and interrupts with the result, even if "
+            "the user has moved to another workspace. Use it for anything long: a "
+            "build, a test run, a download. Do not poll read_terminal in a loop."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "target": {"type": "string", "description": "Empty for the busy pane."},
+                "note": {"type": "string",
+                         "description": "What it is, in the user's words — \"the test run\"."},
+            },
             "additionalProperties": False,
         },
     },
@@ -1112,6 +1237,8 @@ class Executor:
         self.transcript: list[str] = []
         # The window the last web_search opened, so the next one can replace it.
         self._last_search_window: str | None = None
+        # tmux panes being watched for a command to finish, by target.
+        self._watches: dict[str, dict] = {}
         self._lock = threading.Lock()
 
     # -- dispatch -----------------------------------------------------------
@@ -1233,6 +1360,14 @@ class Executor:
             return f'search the {scope} for {args.get("query", "")!r}'
         if name == "open_page":
             return f'open {args.get("url", "")}'
+        if name == "read_terminal":
+            return f'read terminal {args.get("target", "") or "(busiest pane)"}'
+        if name == "list_terminals":
+            return "list the terminal panes"
+        if name == "run_in_terminal":
+            return f'run in terminal: {args.get("command", "")}'
+        if name == "watch_terminal":
+            return f'watch terminal {args.get("target", "") or "(busy pane)"}'
         if name == "system_query":
             return f'look up system {args.get("topic", "")}'
         if name == "remember":
@@ -2045,6 +2180,274 @@ class Executor:
         if not self.config.allow_shell:
             return Result(False, "shell access is disabled in config (allow_shell = false)")
         return self._shell(["bash", "-lc", command], timeout=30)
+
+    # -- terminals, through tmux --------------------------------------------
+    def _tmux(self, *args: str, timeout: float = 8.0) -> Result:
+        if not shutil.which("tmux"):
+            return Result(False, "tmux is not installed (pacman -S tmux)")
+        return self._shell(["tmux", *args], timeout=timeout, limit=1 << 20)
+
+    def _tmux_panes(self) -> list[dict]:
+        """Every pane in every session, whether or not anyone is looking at it."""
+        fmt = ("#{session_name}\t#{session_attached}\t#{window_index}\t"
+               "#{pane_index}\t#{pane_current_command}\t#{pane_title}")
+        listed = self._tmux("list-panes", "-a", "-F", fmt)
+        if not listed.ok:
+            return []
+        panes = []
+        for line in listed.output.splitlines():
+            cell = line.split("\t")
+            if len(cell) < 6:
+                continue
+            panes.append({
+                "target": f"{cell[0]}:{cell[2]}.{cell[3]}",
+                "session": cell[0],
+                "attached": cell[1] not in ("", "0"),
+                "command": cell[4],
+                "title": cell[5],
+                "idle": cell[4] in IDLE_COMMANDS,
+            })
+        return panes
+
+    def _resolve_pane(self, target: str) -> tuple[dict | None, str]:
+        """Which pane `target` means, or (None, why not).
+
+        An empty target is the common case — the user said "the terminal", not
+        "Work:1.2". Prefer a pane someone is actually attached to, and prefer a
+        busy one, because the pane worth reading is nearly always the one with
+        something running in it.
+        """
+        panes = self._tmux_panes()
+        if not panes:
+            return None, ("no tmux session is running. Start one with omarchy_cli "
+                          '"launch terminal tmux", which opens a terminal attached to '
+                          "the Work session; commands run there can be read exactly, "
+                          "from any workspace.")
+        target = (target or "").strip()
+        if target:
+            exact = [p for p in panes if p["target"] == target]
+            if exact:
+                return exact[0], ""
+            loose = [p for p in panes
+                     if target.lower() in (p["target"] + " " + p["title"]).lower()]
+            if len(loose) == 1:
+                return loose[0], ""
+            if not loose:
+                return None, (f"no tmux pane matches {target!r}. Open ones: "
+                              + ", ".join(p["target"] for p in panes))
+            return None, (f"{target!r} matches several panes: "
+                          + ", ".join(p["target"] for p in loose))
+        busy = [p for p in panes if p["attached"] and not p["idle"]]
+        attached = [p for p in panes if p["attached"]]
+        return (busy or attached or panes)[0], ""
+
+    def _capture_pane(self, target: str, lines: int = TERMINAL_LINES) -> Result:
+        got = self._tmux("capture-pane", "-p", "-J", "-S", f"-{int(lines)}", "-t", target)
+        if not got.ok:
+            return got
+        # capture-pane pads to the height of the pane; the blank tail is not
+        # output, it is empty screen.
+        text = "\n".join(got.output.splitlines()).rstrip()
+        if not text.strip():
+            return Result(True, "(that pane is empty)")
+        if len(text) > TERMINAL_OUTPUT_LIMIT:
+            text = "… [earlier output not shown]\n" + text[-TERMINAL_OUTPUT_LIMIT:]
+        return Result(True, text)
+
+    def _validate_read_terminal(self, target: str = "", lines: int = TERMINAL_LINES) -> str | None:
+        try:
+            int(lines)
+        except (TypeError, ValueError):
+            return "lines must be a whole number"
+        return None
+
+    def _tool_read_terminal(self, target: str = "", lines: int = TERMINAL_LINES) -> Result:
+        pane, why = self._resolve_pane(target)
+        if pane is None:
+            return Result(False, why)
+        captured = self._capture_pane(pane["target"], min(int(lines), 2000))
+        if not captured.ok:
+            return captured
+        running = ("idle at the shell" if pane["idle"]
+                   else f"still running {pane['command']!r}")
+        return Result(True, f"{pane['target']} ({running}):\n{captured.output}")
+
+    def _tool_list_terminals(self) -> Result:
+        panes = self._tmux_panes()
+        if not panes:
+            return Result(False, "no tmux session is running")
+        rows = [f"  {p['target']:<16} {'running ' + p['command'] if not p['idle'] else 'idle':<22}"
+                f"{'' if p['attached'] else '(not on screen) '}{p['title'][:40]}"
+                for p in panes]
+        return Result(True, "tmux panes:\n" + "\n".join(rows))
+
+    def _terminal_on_screen(self) -> bool:
+        """Whether a terminal window is being drawn on a workspace in view.
+
+        tmux's `session_attached` is not this. It says a client exists, not that
+        anyone can see it — the client may be in a window on a workspace nobody
+        has looked at since this morning. Running a command somewhere invisible
+        is exactly what this tool must not do, so the compositor gets the last
+        word on what "visible" means.
+        """
+        visible = self._visible_workspaces()
+        for client in self._query_json("clients"):
+            klass = (client.get("class") or "").lower()
+            if not any(name in klass for name in TERMINAL_CLASSES):
+                continue
+            if str((client.get("workspace") or {}).get("name")) in visible:
+                return True
+        return False
+
+    def _ensure_visible_session(self) -> tuple[dict | None, str]:
+        """A pane the user can watch, opening a terminal if there is not one.
+
+        Two conditions, and both are needed: tmux has a client (so keys sent to
+        the pane are being rendered somewhere at all), and a terminal window is
+        on a workspace currently being drawn (so that somewhere is in front of
+        the user).
+        """
+        panes = [p for p in self._tmux_panes() if p["attached"]]
+        if panes and self._terminal_on_screen():
+            idle = [p for p in panes if p["idle"]]
+            return (idle or panes)[0], ""
+        started = self._shell(["omarchy", "launch", "terminal", "tmux"],
+                              timeout=20, grace=LAUNCH_GRACE)
+        if not started.ok:
+            return None, f"could not open a terminal: {started.output}"
+        deadline = time.monotonic() + TERMINAL_ATTACH_TIMEOUT
+        while time.monotonic() < deadline:
+            time.sleep(0.4)
+            fresh = [p for p in self._tmux_panes() if p["attached"]]
+            if fresh and self._terminal_on_screen():
+                time.sleep(0.5)  # let the shell finish drawing its prompt
+                return fresh[0], ""
+        return None, "opened a terminal but tmux never attached to it"
+
+    def _validate_run_in_terminal(self, command: str, target: str = "") -> str | None:
+        if not (command or "").strip():
+            return "command is required"
+        if "\n" in command:
+            return "one command at a time; newlines are not sent"
+        return None
+
+    def _tool_run_in_terminal(self, command: str, target: str = "") -> Result:
+        if error := self._validate_run_in_terminal(command, target):
+            return Result(False, error)
+        command = command.strip()
+        if target:
+            pane, why = self._resolve_pane(target)
+            if pane is not None and not (pane["attached"] and self._terminal_on_screen()):
+                return Result(False,
+                              f"{pane['target']} is not on screen. Commands only run in "
+                              "panes the user can see; read that one instead, or leave "
+                              "target empty to use a visible terminal.")
+        else:
+            pane, why = self._ensure_visible_session()
+        if pane is None:
+            return Result(False, why)
+        if not pane["idle"]:
+            return Result(False,
+                          f"{pane['target']} is busy running {pane['command']!r}; typing "
+                          "into it would go to that program. Wait for it with "
+                          "watch_terminal, or pick another pane.")
+
+        sent = self._tmux("send-keys", "-t", pane["target"], "--", command, "Enter")
+        if not sent.ok:
+            return sent
+        started_at = time.monotonic()
+        deadline = started_at + TERMINAL_QUICK_WAIT
+        seen_busy = False
+        while time.monotonic() < deadline:
+            time.sleep(TERMINAL_POLL)
+            current = next((p for p in self._tmux_panes()
+                            if p["target"] == pane["target"]), None)
+            if current is None:
+                return Result(False, "that pane went away while the command was running")
+            if not current["idle"]:
+                seen_busy = True
+                continue
+            # Idle. Either it finished, or it has not started yet — and telling
+            # those apart is the whole reason for the grace period.
+            if seen_busy or time.monotonic() - started_at > TERMINAL_START_GRACE:
+                out = self._capture_pane(pane["target"])
+                return Result(True, f"ran {command!r} in {pane['target']}:\n{out.output}")
+
+        self.watch(pane["target"], command, seen_busy=seen_busy)
+        return Result(True,
+                      f"{command!r} is still running in {pane['target']} after "
+                      f"{TERMINAL_QUICK_WAIT:.0f}s, so I am watching it and will say when "
+                      "it finishes. Tell the user that, and carry on with something else "
+                      "rather than waiting.")
+
+    # -- watching a pane ----------------------------------------------------
+    def watch(self, target: str, label: str = "", seen_busy: bool = False) -> None:
+        self._watches[target] = {"label": label or "the command",
+                                 "started": time.monotonic(),
+                                 "seen_busy": seen_busy}
+
+    def _validate_watch_terminal(self, target: str = "", note: str = "") -> str | None:
+        return None
+
+    def _tool_watch_terminal(self, target: str = "", note: str = "") -> Result:
+        pane, why = self._resolve_pane(target)
+        if pane is None:
+            return Result(False, why)
+        if pane["idle"]:
+            out = self._capture_pane(pane["target"], 40)
+            return Result(False,
+                          f"{pane['target']} is already idle — nothing is running there to "
+                          f"wait for. What it last showed:\n{out.output}")
+        # Busy was just confirmed above, so idle from here means finished —
+        # this watch does not need the start-up grace.
+        self.watch(pane["target"], note or pane["command"], seen_busy=True)
+        return Result(True,
+                      f"watching {pane['target']} ({pane['command']}). I will say when it "
+                      "finishes, even if the user has moved to another workspace. Do not "
+                      "wait here — say that it is being watched and carry on.")
+
+    def poll_watches(self) -> list[dict]:
+        """Watches that are over, and why. Called from the daemon's background loop.
+
+        Three ways to be over, and the middle one is the reason this is not a
+        one-liner. A pane that is idle has either finished or *not started yet*:
+        `pane_current_command` still says "bash" for a moment after the keys are
+        sent, because the shell has not forked. Reporting that as finished
+        handed back a twenty-second command as done in under half a second.
+        So a watch has to see the pane busy before idle means anything — unless
+        the grace period passes without it ever looking busy, which is what an
+        instant command or a shell builtin like `cd` looks like.
+
+        Returns and forgets, so a finished job is announced exactly once.
+        """
+        if not self._watches:
+            return []
+        panes = {p["target"]: p for p in self._tmux_panes()}
+        finished, now = [], time.monotonic()
+        for target, watch in list(self._watches.items()):
+            pane = panes.get(target)
+            age = now - watch["started"]
+            if pane is None:
+                reason = "vanished"
+            elif not pane["idle"]:
+                watch["seen_busy"] = True
+                if age <= WATCH_MAX_SECONDS:
+                    continue
+                reason = "timed_out"
+            elif not watch["seen_busy"] and age <= TERMINAL_START_GRACE:
+                continue  # keys are sent but the shell has not forked yet
+            else:
+                reason = "finished"
+            del self._watches[target]
+            finished.append({
+                "target": target,
+                "label": watch["label"],
+                "seconds": age,
+                "vanished": reason == "vanished",
+                "timed_out": reason == "timed_out",
+                "tail": "" if reason == "vanished" else self._capture_pane(target, 30).output,
+            })
+        return finished
 
     # -- the web ------------------------------------------------------------
     def _open_web_window(self, url: str, hint: str,

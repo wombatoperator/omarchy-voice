@@ -1,6 +1,6 @@
 # omarchy-voice — 0.3.0
 
-**Status as of 2026-08-31.** 283 tests passing. Published at
+**Status as of 2026-08-31.** 327 tests passing. Published at
 <https://github.com/wombatoperator/omarchy-voice> (MIT, public).
 
 ## Where things stand
@@ -8,8 +8,8 @@
 | | |
 |---|---|
 | Daemon | running as a systemd user service, `gpt-realtime-2.1` |
-| Prompt | ~8,900 tokens a turn — 6,900 plus the reach and web tools below |
-| Tests | 283 |
+| Prompt | ~9,700 tokens a turn. No longer the constraint — see below |
+| Tests | 327 |
 | Clicking | working end to end, verified against a live browser |
 
 ### Open pull requests to Omarchy
@@ -61,6 +61,87 @@ wording that appears once, or drive the app with `send_shortcut` instead.
 `ydotool mousemove --absolute` lands at twice the requested coordinates on this
 display, so positioning stays with `hl.dsp.cursor.move` and ydotool is only
 asked to press the button.
+
+## The rate limit was real, and is gone
+
+`rate_limits.updated` is logged now, which it never was — the reason "tier 3
+but enforced at 40,000" took a whole session to diagnose. The server states the
+ceiling on every turn, so write it down:
+
+```
+limits  tokens: 797790/800000 left, resets in 0.165s
+```
+
+800,000, not 40,000. The legacy `gpt-4o-realtime` alias bucket that was capping
+this account has been fixed on OpenAI's side. Every "trim the prompt to buy
+turns" argument in the sections below was true when written and is now mostly
+moot — spend tokens on capability.
+
+## Terminals are text now
+
+A terminal was a picture: `grim` the window, `tesseract` it, hope. That made
+output garbled, readable only while the window was visible, and invisible with
+the display asleep or the session locked. Input was worse — `wtype` into
+whatever had focus, with no way to tell whether it landed.
+
+tmux answers all of it, and Omarchy already ships it:
+
+```
+capture-pane -p        exact scrollback, from a pane on no workspace at all
+pane_current_command   bash -> sleep -> bash: "is it finished", for free
+send-keys              input with no focus, no keysym, no window target
+list-panes -a          structured state across every session
+```
+
+`send-keys` taking the key by *name* means the entire keysym problem that cost
+the last session does not exist on this path.
+
+Four tools: `read_terminal`, `list_terminals`, `run_in_terminal`,
+`watch_terminal`. Reading and listing are read-only, so they work under
+`--dry-run` and are strictly safer than `read_screen`, which ships a picture of
+the screen to OpenAI.
+
+**Running is restricted to panes the user can see.** Two conditions, both
+required: tmux has a client, *and* a terminal window is on a workspace the
+compositor is currently drawing. `session_attached` alone is not enough — it
+says a client exists, not that anyone is looking at it, and the client may be
+in a window on a workspace nobody has visited since this morning. An open
+microphone should not be able to run commands in a window with no view of it.
+
+## Saying something without being asked
+
+`_watch_loop` polls `Executor.poll_watches` every two seconds and, when a
+watched command ends, puts an item in the conversation and asks for a response
+— the same move the desktop snapshot already makes every turn, so the model
+speaks about it in its own voice rather than a canned string being read out.
+What is new is the trigger, not the plumbing.
+
+The rules on interrupting: never across a reply in flight; never closer
+together than eight seconds; a desktop notification instead of speech when
+listening is off, because talking into a room that is not listening is noise;
+and the item says explicitly that the user did **not** just speak, or the model
+answers as though it had been asked something.
+
+### The race that made it wrong twice
+
+`pane_current_command` does not update the instant `send-keys` returns — the
+shell has not forked yet. So the first poll saw `bash`, concluded the command
+had finished, and handed back the echoed command line as its output: a
+twenty-second job reported done in 0.4 seconds. `watch_terminal` had the same
+bug from the other end.
+
+A watch now has to observe the pane *busy* before idle means anything. If it
+never looks busy inside a grace period, the command really was instant — or was
+a shell builtin like `cd`, which never forks at all.
+
+Measured rather than guessed: **tmux reflected the forked command in 0.024s,
+six times out of six.** The grace is 0.6s, 25x that, and it is the floor on how
+long an instant command appears to take — the first draft's 2.5s meant `echo
+hello` sat silent for nearly three seconds.
+
+A second bug fell out of the same rewrite: a watch on a pane that stayed busy
+forever never timed out, because the "still running" branch `continue`d before
+the age check. It would have been held until the daemon restarted.
 
 ## Chrome's "Profile error occurred" box
 
@@ -538,7 +619,7 @@ audio, and whatever else is on screen goes with it.
 ```bash
 git clone https://github.com/wombatoperator/omarchy-voice
 cd omarchy-voice
-python3 -m unittest discover -s tests      # 283 tests
+python3 -m unittest discover -s tests      # 327 tests
 ./bin/omarchy-voice doctor
 ./bin/omarchy-voice --dry-run say "what's going on in the news today"
 python3 tools/bench_realtime.py            # costs API tokens

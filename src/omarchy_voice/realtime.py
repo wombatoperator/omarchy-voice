@@ -93,6 +93,14 @@ def frame_level(chunk: bytes) -> float:
 # when a new turn starts, but not more often than this.
 STATE_REFRESH_SECONDS = 5.0
 
+# How often the background watcher asks tmux whether a watched command has
+# finished. Two seconds is well under the time it takes anyone to notice, and
+# the poll is one `tmux list-panes`, which costs nothing.
+WATCH_POLL_SECONDS = 2.0
+# Do not interrupt more often than this, however many jobs land together. An
+# assistant that talks over itself is worse than one that is slightly late.
+WATCH_MIN_GAP_SECONDS = 8.0
+
 
 class RealtimeUnavailable(RuntimeError):
     """Something the realtime path needs is missing; the message says what."""
@@ -349,6 +357,8 @@ class RealtimeSession:
         self._state_item: str | None = None
         self._state_seq = 0
         self._refresh_task: asyncio.Task | None = None
+        self._watch_task: asyncio.Task | None = None
+        self._last_interruption = 0.0
         self._user_turn_since_hold = False
         self._ignored_responses: set[str] = set()
         self._audio_item_id: str | None = None
@@ -440,6 +450,71 @@ class RealtimeSession:
         if self._refresh_task is not None and not self._refresh_task.done():
             return
         self._refresh_task = asyncio.create_task(self._refresh_state())
+
+    async def _watch_loop(self) -> None:
+        """Say when a watched command finishes, without being asked.
+
+        Everything else this daemon does is a reply. This is the one thing it
+        starts on its own: a build that ends on workspace two is news, and the
+        user should not have to remember to come back and ask.
+
+        The mechanics are the same move the desktop snapshot already makes —
+        put an item in the conversation, ask for a response — so the model
+        speaks about it in its own voice rather than a canned string being read
+        out. What is new is the trigger.
+        """
+        while not self._stop.is_set():
+            try:
+                await asyncio.sleep(WATCH_POLL_SECONDS)
+                finished = await asyncio.to_thread(self.executor.poll_watches)
+                for job in finished:
+                    await self._announce(job)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:  # a watcher must never take the session down
+                self.feedback.log(f"warn    watcher: {type(exc).__name__}: {exc}")
+
+    async def _announce(self, job: dict) -> None:
+        """Interrupt with a finished job — or notify, if nobody is listening."""
+        if job["vanished"]:
+            headline = f"The pane running {job['label']} was closed."
+        elif job["timed_out"]:
+            headline = f"{job['label']} is still going after a long time."
+        else:
+            headline = f"{job['label']} finished in {job['seconds']:.0f} seconds."
+        self.feedback.log(f"watch   {job['target']}: {headline}")
+
+        # Muted means the microphone is off, and speaking into a room that is
+        # not listening is just noise. A notification waits until it is read.
+        if not self.active:
+            self.feedback.notify("Oma", headline)
+            return
+        # Never cut across a reply in flight, and never pile announcements on
+        # top of each other. Late is fine; talking over yourself is not.
+        while self._response_running and not self._stop.is_set():
+            await asyncio.sleep(0.5)
+        gap = time.time() - self._last_interruption
+        if gap < WATCH_MIN_GAP_SECONDS:
+            await asyncio.sleep(WATCH_MIN_GAP_SECONDS - gap)
+        if self._stop.is_set():
+            return
+        self._last_interruption = time.time()
+        tail = (job["tail"] or "").strip()
+        await self._send({
+            "type": "conversation.item.create",
+            "item": {"type": "message", "role": "system", "content": [{
+                "type": "input_text",
+                "text": (
+                    f"# A watched command finished\n\n{headline} It ran in tmux pane "
+                    f"{job['target']}.\n\nThe last of what it printed:\n\n{tail}\n\n"
+                    "Tell the user now, unprompted and in one short sentence: what "
+                    "finished, and whether it looks like it worked, from the output "
+                    "above rather than from hope. Then ask if they want you to carry "
+                    "on. They did not just speak to you — do not answer as though "
+                    "they had."
+                )}]},
+        })
+        await self._send({"type": "response.create"})
 
     async def _refresh_state(self, force: bool = False) -> None:
         """Append a fresh desktop snapshot to the conversation, between turns.
@@ -695,6 +770,14 @@ class RealtimeSession:
             error = event.get("error") or {}
             self.feedback.log(
                 f"heard   (transcription failed: {error.get('message', 'unknown')})")
+        elif kind == "rate_limits.updated":
+            # Never logged before, which is why "tier 3 but enforced at 40k"
+            # took a session to notice. The server states the real ceiling on
+            # every turn; write it down.
+            for limit in event.get("rate_limits") or []:
+                self.feedback.log(
+                    f"limits  {limit.get('name')}: {limit.get('remaining')}"
+                    f"/{limit.get('limit')} left, resets in {limit.get('reset_seconds')}s")
         elif kind == "response.created":
             self._response_running = True
         elif kind == "response.done":
@@ -938,6 +1021,7 @@ class RealtimeSession:
 
         control = ControlServer(self._control)
         control.start()
+        self._watch_task = asyncio.create_task(self._watch_loop())
         self.feedback.state("listening" if self.active else "idle")
         self.feedback.log(f"start   engine=realtime model={self.config.realtime_model} "
                           f"voice={self.config.realtime_voice} "
@@ -957,8 +1041,9 @@ class RealtimeSession:
             return 1
         finally:
             self._stop.set()
-            if self._refresh_task is not None:
-                self._refresh_task.cancel()
+            for task in (self._refresh_task, self._watch_task):
+                if task is not None:
+                    task.cancel()
             await self._kill_mic()
             await self.speaker.close()
             await asyncio.to_thread(control.stop)

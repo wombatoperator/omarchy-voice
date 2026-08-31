@@ -184,6 +184,35 @@ them on screen.
 exists: nothing new appears in `hyprctl`, so it cannot be waited for, read, or
 verified. Oma is told this, and the tool refuses it with the right call named.
 
+### Terminals, and being told when something is done
+
+A terminal used to be a *picture* — grim the window, run tesseract, hope. Now it
+goes through tmux, which Omarchy already ships:
+
+```
+you   "run the tests and tell me when they're done"
+      → run_in_terminal({ command = "python3 -m unittest discover -s tests" })
+it    "That's running; I'll say when it finishes."
+      ⋮ (you go and do something else, on another workspace)
+it    "The tests finished in 19 seconds and all 327 passed. Want me to carry on?"
+```
+
+That last line is the only thing this daemon ever says without being asked.
+`capture-pane` gives exact text from a pane on **any** workspace — or none, or
+with the display asleep — and `pane_current_command` dropping back to your shell
+is the "it's done" signal, no heuristics. `send-keys` takes the key by name, so
+none of the keysym trouble applies.
+
+`run_in_terminal` only runs in a pane you can actually see: tmux must have a
+client *and* a terminal window must be on a workspace the compositor is
+currently drawing. An open microphone should not be able to run things in a
+window you have no view of. Reading and watching have no such limit — they are
+safer than `read_screen`, which ships a picture of your screen to OpenAI.
+
+Announcements wait for a reply in flight to finish, never land closer together
+than 8 seconds, and become a desktop notification instead of speech when
+listening is off.
+
 ### Going after a goal
 
 The interesting requests are not one action. "Get me to that pull request and
@@ -198,6 +227,7 @@ what is next — and the tools are shaped so that loop can actually close:
 | `system_query` | "How much space is left", "am I on wifi", "why is the fan loud" are questions about the machine, not about a window. Read-only, no shell. |
 | `remember` | When listening is toggled off the conversation is gone. This is the only memory a goal spanning two sittings has. |
 | `web_search` / `open_page` | Anything you do not know or cannot see. Results open as a real window — visible to you, and readable, scrollable and clickable by her. |
+| `read_terminal` / `run_in_terminal` / `watch_terminal` | A terminal as exact text rather than OCR, on any workspace or none — and an interruption when a long job ends. |
 | `read_screen(query=…)` | A screenful of OCR is a couple of thousand tokens. Ask for the line you need and pay for the line you need. |
 
 `max_turns` (default 12) is how many tool rounds one spoken instruction gets
@@ -234,8 +264,11 @@ So the size of the prompt *is* how many things you can say in a minute:
 omarchy-voice manifest | wc -c     # the biggest part of it
 ```
 
-At the default 40,000 TPM and roughly 10,200 tokens a turn, that is about four
-turns a minute. Past that the API starts refusing responses; the daemon waits
+At 40,000 TPM and roughly 10,200 tokens a turn that is about four turns a
+minute; at the 800,000 a full tier-3 realtime bucket gives you, it stops
+mattering. `omarchy-voice log` now records what the server says your ceiling
+actually is on every turn (`limits  tokens: 797790/800000 left`) — worth
+checking, because the two are not always the same. Past that the API starts refusing responses; the daemon waits
 the interval the server names and asks again rather than going quiet, but it
 cannot make the budget bigger. If Oma feels like it is pausing between
 sentences, that is what is happening — check your tier at
