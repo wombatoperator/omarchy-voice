@@ -6,7 +6,10 @@
 # to the Realtime API; this is the Chat Completions model for one-shot plans.
 planner_model = "gpt-4.1"
 api_key_env = "OPENAI_API_KEY"
-max_turns = 8
+# How many tool rounds one spoken instruction may take before the assistant
+# stops and waits to be asked again. Multi-step goals need the room; every
+# round is also a turn against the API's per-minute token budget.
+max_turns = 12
 
 [ears]
 # Listening always starts off. SUPER + SHIFT + V, or the bar widget, turns it

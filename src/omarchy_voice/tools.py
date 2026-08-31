@@ -16,15 +16,17 @@ import os
 import shlex
 import shutil
 import subprocess
+import tempfile
 import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
-from urllib.parse import urlparse
+from urllib.parse import parse_qs, quote_plus, urlparse
 
 from . import capabilities
 from .config import Config
+from .keys import normalise_key, normalise_mods
 
 QUERY_KINDS = {
     "clients", "workspaces", "monitors", "activewindow", "activeworkspace",
@@ -32,7 +34,7 @@ QUERY_KINDS = {
 }
 
 # Read-only tools still run under --dry-run so the planner can see the desktop.
-READ_ONLY_TOOLS = {"hypr_query", "read_screen", "omarchy_help"}
+READ_ONLY_TOOLS = {"hypr_query", "read_screen", "omarchy_help", "system_query"}
 
 # Hyprland dispatchers that spawn processes. They bypass allow_shell unless
 # we reject them here.
@@ -130,6 +132,118 @@ def _required_hits(word_count: int) -> int:
     one misread letter is worse than the occasional near-miss.
     """
     return word_count if word_count <= 3 else word_count - 1
+# --- searching the web ------------------------------------------------------
+#
+# The query goes in the URL. Nothing is typed.
+#
+# From a real session: asked to search for something, the assistant pressed
+# CTRL+T, typed the query, and pressed Return five different ways before giving
+# up — because the window it was driving was opened by `omarchy launch webapp`,
+# which is `chrome --app=<url>`. An app window has no tab bar and no address
+# bar, so CTRL+T and CTRL+L are no-ops and there was never anywhere for the
+# text to go. Twelve tool rounds, no search. `omarchy launch browser <url>`
+# does have an omnibox, but it opens a *tab in the window that already exists*,
+# so nothing new appears in the window list and the assistant concluded — also
+# wrongly — that the launch had failed.
+#
+# Both problems disappear if the query is part of the URL and the result opens
+# as its own window: no typing, and a window that can be waited for, read,
+# scrolled and clicked like any other.
+SEARCH_SCOPES = {
+    "web": "https://www.google.com/search?q={q}",
+    "news": "https://www.google.com/search?q={q}&tbm=nws",
+    "images": "https://www.google.com/search?q={q}&tbm=isch",
+    "videos": "https://www.google.com/search?q={q}&tbm=vid",
+    # No consent interstitial and a plainer results page, for when Google's
+    # answer panels get in the way of the actual links.
+    "duckduckgo": "https://duckduckgo.com/?q={q}",
+}
+# Scopes whose point is to be looked at. OCR of a wall of thumbnails is noise,
+# and the user asked for them because they wanted to see them.
+VISUAL_SCOPES = {"images", "videos"}
+# A new search replaces the last one's window rather than adding to it, so a
+# research session does not end up with nine identical result panes. Only the
+# window *this tool* opened is closed — matching on class would also take down
+# a duckduckgo pane the user had asked for by name.
+# A launched window is mapped well before it has painted anything worth
+# reading. Measured: a Google results page needs about two seconds after the
+# surface appears, and a slow one is caught by the empty-read retry.
+WEB_WINDOW_TIMEOUT = 15.0
+WEB_RENDER_SETTLE = 2.0
+# Chromium's crash-restore bubble covers the top of the first window it opens
+# afterwards, which is exactly where search results are. It ate a whole turn.
+RESTORE_BUBBLE = "restore pages"
+
+# Chrome's "Profile error occurred" box. Not corruption — the profile's SQLite
+# databases check out `integrity: ok`. It is lock contention: `omarchy launch
+# webapp` starts a *new* google-chrome process each time, which is meant to
+# hand off to the browser already running and exit. When several are launched
+# in a row, or one is launched while a heavy page is still loading, the handoff
+# loses the race and the new process opens the profile itself. Chrome's own log
+# at that moment:
+#
+#   ERROR ukm_database_backend.cc:142] Failed to open UKM database: database is locked
+#   ERROR top_sites_backend.cc:77]     Failed to initialize database.
+#
+# The dialog has no window class, so _await_new_window already refuses to
+# mistake it for a pane, but it still takes focus and covers the screen. It is
+# harmless and transient, so it is closed on sight rather than reported.
+PROFILE_ERROR_TITLE = "profile error"
+
+# --- reach, patience, and memory -------------------------------------------
+#
+# A screen shows what fits; an application answers when it is ready; and a
+# session ends when listening is toggled off. Each of those is a wall the
+# assistant used to stop at, and each has one tool below.
+
+# How far one wheel notch scrolls, in pixels. Measured against a browser on this
+# machine: ten notches moved a tracked word from y=547 to y=141, so 40.6 px a
+# notch — which is the 40 px Chromium and most GTK apps use. It is the
+# application's number, not the compositor's, so a terminal (three lines) or a
+# PDF viewer will differ; `amount` is documented as approximate for that reason.
+SCROLL_PIXELS_PER_CLICK = 40
+# A screen with a couple of lines of overlap, because reading down a page wants
+# continuity rather than a clean cut between screenfuls. Clamped so a tiny pane
+# still moves and a 4K window does not fire a burst big enough for the
+# application's own momentum scrolling to run away with it.
+SCROLL_MIN_CLICKS, SCROLL_MAX_CLICKS = 4, 30
+SCROLL_PAGE_OVERLAP = 0.85
+SCROLL_MAX_PAGES = 10
+# REL_WHEEL counts up when the wheel turns away from you, which scrolls the page
+# up, so "down" is negative. Measured, not taken from the header: scrolling
+# "down" moved tracked words 406 px *up* the screen, twice, on a live browser.
+SCROLL_SIGN = {"down": -1, "up": 1, "right": 1, "left": -1}
+
+
+def _scroll_clicks(height: int, pages: int) -> int:
+    """Wheel notches for `pages` screenfuls of a window `height` px tall.
+
+    Fixed at ten notches this used to move 406 px of a 1030 px window — 40% of
+    a screen while telling the model it had moved one, which is how you read
+    half an article and believe you read all of it.
+    """
+    per_page = round(height * SCROLL_PAGE_OVERLAP / SCROLL_PIXELS_PER_CLICK)
+    per_page = max(SCROLL_MIN_CLICKS, min(per_page, SCROLL_MAX_CLICKS))
+    return per_page * pages
+
+# wait_for. The cap is short on purpose: the assistant is mute while it waits,
+# and silence is the one thing a voice interface cannot afford much of.
+WAIT_DEFAULT = 8.0
+WAIT_MAX = 25.0
+# A window either exists or it does not, so ask often. OCR costs a screen
+# capture and a tesseract run, so ask rarely — the poll gap is on top of that.
+WAIT_POLL_WINDOW = 0.35
+WAIT_POLL_TEXT = 0.6
+
+# Clipboards hold whole documents. This is handed to the model, so it is
+# bounded like OCR output is.
+CLIPBOARD_LIMIT = 4000
+
+# The notebook. Small enough that reading it back is never the expensive part
+# of a turn.
+NOTES_LIMIT = 40
+NOTE_LENGTH_LIMIT = 240
+
 # ydotool button codes: 0xC0 is press+release, +1 right, +2 middle.
 YDOTOOL_BUTTONS = {"left": "0xC0", "right": "0xC1", "middle": "0xC2"}
 CLICK_UNAVAILABLE = (
@@ -267,13 +381,16 @@ TOOL_SCHEMAS = [
         "description": (
             "Press a key combination inside a window — the way to drive an application's "
             "own UI (new browser tab, editor save, close a dialog). Prefer this over "
-            "typing text for anything that is a command rather than content."
+            "typing text for anything that is a command rather than content. Key names "
+            "are X keysyms; common spoken names ('enter', 'esc', 'page down') are "
+            "translated, and a name that is not a key is refused rather than pressed."
         ),
         "input_schema": {
             "type": "object",
             "properties": {
                 "mods": {"type": "string", "description": 'e.g. "CTRL", "CTRL SHIFT", or "" for none.'},
-                "key": {"type": "string", "description": 'e.g. "T", "Return", "Escape", "Page_Down".'},
+                "key": {"type": "string",
+                        "description": 'e.g. "T", "Return" (the enter key), "Escape", "Page_Down".'},
                 "window": {"type": "string",
                            "description": 'Target: "activewindow", or "address:0x..." / "class:chromium".'},
             },
@@ -321,18 +438,13 @@ TOOL_SCHEMAS = [
     {
         "name": "launch_app",
         "description": (
-            "Start an application by desktop entry id, for apps with no entry in "
-            "the manifest's \"Apps this desktop already knows how to open\" list. "
-            "If the app IS in that list, use omarchy_cli with the exact command "
-            "shown there — those launch-or-focus correctly and get the right "
-            "window rules. Names like 'terminal' or 'browser' are omarchy launch "
-            "routes, not desktop ids, and will fail here. "
-            "For a SECOND window of an app that is already open, pass "
-            "'<desktop-id>:<action>' — e.g. 'google-chrome:new-window', or "
-            "'google-chrome:new-private-window' for incognito. Launching an app "
-            "normally focuses the window that already exists instead of opening "
-            "another one. "
-            "Do not pass a shell command line."
+            "Start an application by desktop entry id, for apps NOT in the manifest's "
+            'app list — for ones that are, use omarchy_cli with the command shown '
+            "there. 'terminal' and 'browser' are omarchy routes, not desktop ids, and "
+            "fail here. For a SECOND window of an app already open, pass '<desktop- "
+            "id>:<action>', e.g. 'google-chrome:new-window'. Not a shell command "
+            'line, and for a web page use open_page instead — this hands off to the '
+            'browser, which opens an invisible tab.'
         ),
         "input_schema": {
             "type": "object",
@@ -361,17 +473,65 @@ TOOL_SCHEMAS = [
         },
     },
     {
+        "name": "web_search",
+        "description": (
+            'Search the web and put the results on screen, in a window on the '
+            'workspace the user is already looking at. This is the tool for a '
+            'QUESTION — a price, a score, a date, news, who someone is, whether '
+            'something is true — and for "show me" (scope images/videos). Do not open '
+            "a site's home page and hope; search for the answer. The query goes in "
+            'the URL, so there is nothing to type: never CTRL+T or CTRL+L, the web '
+            'panes here are app windows with no address bar. Results come back as '
+            'text AND stay on screen. Follow up with scroll, click_text or '
+            'read_screen on the window it names.'
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "query": {"type": "string", "description": "What to search for, in plain words."},
+                "scope": {
+                    "type": "string",
+                    "enum": ["web", "news", "images", "videos", "duckduckgo"],
+                    "description": (
+                        '"web" (default) — Google, whose answer panel often answers the '
+                        'question outright. "news" for what happened recently, "images" / '
+                        '"videos" when the user wants to SEE something, "duckduckgo" for a '
+                        "plain list of links when Google's panels are in the way."
+                    ),
+                },
+            },
+            "required": ["query"],
+            "additionalProperties": False,
+        },
+    },
+    {
+        "name": "open_page",
+        "description": (
+            "Open a URL as its own window and read it. Use this rather than launch_app "
+            "with a url: that one hands off to the browser, which opens a tab inside a "
+            "window that already exists — nothing new appears, and you cannot tell "
+            "whether it worked. This gives you a window with an address you can read, "
+            "scroll and click."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "url": {"type": "string", "description": "An http(s) URL."},
+                "read": {"type": "boolean",
+                         "description": "Read the page once it loads. Default true."},
+            },
+            "required": ["url"],
+            "additionalProperties": False,
+        },
+    },
+    {
         "name": "read_screen",
         "description": (
-            "Read the text that is on screen right now, with OCR. This is how you answer "
-            "\"what does it say\", \"summarise this\", \"what's in the news\", \"read me the "
-            "error\" — questions about CONTENT rather than about which windows exist. "
-            "hypr_query tells you a window is called \"BBC News\"; this tells you what it "
-            "says. Default target is the whole visible screen, which is usually what you "
-            "want after composing a workspace: it reads every pane at once. "
-            "Only windows currently visible can be read — a window on another workspace is "
-            "not being drawn, so switch to it first. OCR is imperfect on small or stylised "
-            "text; quote what you got rather than inventing what you expected."
+            'OCR the text on screen — CONTENT, where hypr_query gives you window '
+            'names. The default reads the whole visible screen, which is what you '
+            'want after composing a workspace. Only visible windows can be read; '
+            'switch workspace first. OCR is imperfect on small or stylised text, so '
+            'quote what you got rather than what you expected.'
         ),
         "input_schema": {
             "type": "object",
@@ -382,6 +542,14 @@ TOOL_SCHEMAS = [
                         '"screen" for the whole focused monitor (the default), '
                         '"activewindow" for the focused window, or an "address:0x..." '
                         "from hypr_query for one specific visible window."
+                    ),
+                },
+                "query": {
+                    "type": "string",
+                    "description": (
+                        "Optional words to look for. With it you get the matching lines "
+                        "rather than the whole screenful — use it for one fact (a price, "
+                        "an error, whether a setting is on), leave it out to summarise."
                     ),
                 },
             },
@@ -418,18 +586,15 @@ TOOL_SCHEMAS = [
     {
         "name": "compose_windows",
         "description": (
-            "Build a whole workspace for a task in one call: open several windows and "
-            "lay them out together. This is the right tool whenever the user asks for a "
-            "SUBJECT rather than an application — \"what's going on in the news today\", "
-            "\"set me up to work on the budget\", \"I want to watch the game and follow "
-            "the chat\". You choose what belongs on screen; pick real, current sites you "
-            "know, and prefer the exact commands in the manifest's app list for anything "
-            "this desktop already knows how to open. "
-            "It waits for each window to actually appear before placing the next one, so "
-            "do NOT follow it with your own move/focus calls — that races the layout it "
-            "just built. Two to four panes is the useful range; more than that on one "
-            "screen is unreadable. Say what you are opening before you call it: this "
-            "takes a few seconds."
+            'Open several windows and lay them out together, to SET UP a workspace to '
+            'work or watch in — "set me up to work on the budget", "I want the game '
+            'and the chat". Two to four panes, and it goes to an empty workspace, so '
+            'it takes the user away from what they were doing. It is NOT how you '
+            'answer a question: for that, and for anything that only needs one '
+            'window, use web_search or open_page. It waits for each window to appear '
+            'before placing the next, so do NOT follow it with your own move/focus '
+            'calls — that races the layout it just built. Takes a few seconds; say '
+            'what you are opening first.'
         ),
         "input_schema": {
             "type": "object",
@@ -487,6 +652,117 @@ TOOL_SCHEMAS = [
         },
     },
     {
+        "name": "scroll",
+        "description": (
+            "Scroll a window, to bring what is below the fold into view for read_screen "
+            "or click_text. Read the screen again afterwards; the text changed."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "direction": {"type": "string", "enum": ["down", "up", "left", "right"]},
+                "amount": {"type": "integer",
+                           "description": ("Roughly how many screenfuls. Default 1, "
+                                           "max 10; how far a notch goes is the "
+                                           "application's choice, so read to check.")},
+                "target": {
+                    "type": "string",
+                    "description": (
+                        '"activewindow" (default) or an "address:0x...". The pointer is '
+                        "moved there first, so with panes side by side this picks which "
+                        "one moves."
+                    ),
+                },
+            },
+            "required": ["direction"],
+            "additionalProperties": False,
+        },
+    },
+    {
+        "name": "wait_for",
+        "description": (
+            "Block until something has happened, then carry on. Use it between doing a "
+            "thing and depending on it — a page loading, a window appearing. Returns as "
+            "soon as the condition holds; a timeout comes back as a fact to report, not "
+            "as an error."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "what": {
+                    "type": "string",
+                    "enum": ["text", "window", "window_gone"],
+                    "description": ('"text": those words on screen. "window"/"window_gone": '
+                                    "a window whose class or title contains the value."),
+                },
+                "value": {"type": "string", "description": "Words, class or title."},
+                "timeout": {"type": "number", "description": "Seconds. Default 8, max 25."},
+            },
+            "required": ["what", "value"],
+            "additionalProperties": False,
+        },
+    },
+    {
+        "name": "clipboard",
+        "description": (
+            "Read or write the system clipboard. Reading gives exact characters where "
+            "read_screen only guesses at pixels: have the application copy something "
+            "(CTRL+C, or CTRL+A then CTRL+C for a page) and read it here. Writing leaves "
+            "text for the user to paste."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "action": {"type": "string", "enum": ["read", "write"]},
+                "text": {"type": "string", "description": "What to copy (write only)."},
+            },
+            "required": ["action"],
+            "additionalProperties": False,
+        },
+    },
+    {
+        "name": "system_query",
+        "description": (
+            "Ask the machine about itself — disk, memory, battery, network, bluetooth, "
+            "audio, uptime, temperature, time, OS version, what is using the CPU. "
+            "Read-only and always allowed; it needs no shell."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "topic": {
+                    "type": "string",
+                    "enum": ["disk", "memory", "battery", "network", "bluetooth",
+                             "audio", "uptime", "processes", "temperature", "time", "os"],
+                },
+            },
+            "required": ["topic"],
+            "additionalProperties": False,
+        },
+    },
+    {
+        "name": "remember",
+        "description": (
+            "The notebook, and the only memory that outlives a session — when listening "
+            "is toggled off the conversation is gone. Note a goal when you take one on "
+            "and each step as it lands; list it back when the user picks the thread up "
+            "again (\"where were we\")."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "action": {"type": "string", "enum": ["note", "list", "forget"]},
+                "text": {
+                    "type": "string",
+                    "description": ("note: one line that still makes sense tomorrow. "
+                                    "forget: words identifying it, or \"all\"."),
+                },
+            },
+            "required": ["action"],
+            "additionalProperties": False,
+        },
+    },
+    {
         "name": "run_shell",
         "description": (
             "Run a shell command. Disabled unless the user turned it on in config. "
@@ -504,7 +780,182 @@ TOOL_SCHEMAS = [
 ]
 
 
+# What "ask the machine about itself" is allowed to run. Fixed argv, no shell,
+# nothing that writes: this is a reference table, not a command builder, so a
+# misheard sentence cannot steer it anywhere. Anything not installed is skipped
+# rather than reported as an error — `sensors` and `nmcli` are both optional.
+SYSTEM_QUERIES: dict[str, object] = {
+    "disk": [("", ["df", "-h", "--output=target,size,used,avail,pcent",
+                   "-x", "tmpfs", "-x", "devtmpfs", "-x", "efivarfs"])],
+    "memory": [("", ["free", "-h"])],
+    "battery": None,  # filled in below; it reads /sys rather than shelling out
+    "network": [("connections", ["nmcli", "-t", "-f", "NAME,TYPE,DEVICE",
+                                 "connection", "show", "--active"]),
+                ("state", ["nmcli", "-t", "-f", "STATE,CONNECTIVITY", "general"])],
+    # --timeout is not optional. With no controller present bluetoothctl waits
+    # for one forever: on this machine `bluetoothctl show` was still running at
+    # five seconds, which on a voice channel is five seconds of silence.
+    "bluetooth": None,  # filled in below; it checks for an adapter first
+    "audio": [("default sink", ["pactl", "get-default-sink"]),
+              ("volume", ["pactl", "get-sink-volume", "@DEFAULT_SINK@"]),
+              ("muted", ["pactl", "get-sink-mute", "@DEFAULT_SINK@"])],
+    "uptime": [("", ["uptime", "-p"]), ("booted", ["uptime", "-s"])],
+    # ps lists every process on the machine. The question is "what is making
+    # the fan spin", and the answer is the top of that list, not all of it.
+    "processes": [("busiest (%cpu %mem)", ["ps", "-eo", "pcpu,pmem,comm",
+                                           "--sort=-pcpu", "--no-headers"], 10)],
+    "temperature": [("", ["sensors"])],
+    "time": [("", ["date", "+%A %-d %B %Y, %H:%M %Z"]),
+             ("timezone", ["timedatectl", "show", "-p", "Timezone", "--value"])],
+    "os": [("", ["uname", "-sr"]),
+           ("distribution", ["sh", "-c", "true"])],  # replaced below
+}
+
+
+def _os_release() -> str:
+    for line in Path("/etc/os-release").read_text().splitlines():
+        if line.startswith("PRETTY_NAME="):
+            return line.partition("=")[2].strip().strip('"')
+    return ""
+
+
+def _os_report(executor) -> "Result":
+    parts = []
+    try:
+        if pretty := _os_release():
+            parts.append(pretty)
+    except OSError:
+        pass
+    for argv in (["uname", "-sr"], ["hyprctl", "version", "-j"]):
+        got = executor._shell(argv, timeout=8, limit=800)
+        if not got.ok:
+            continue
+        if argv[0] == "hyprctl":
+            try:
+                parts.append("Hyprland " + json.loads(got.output).get("tag", "").lstrip("v"))
+            except (json.JSONDecodeError, AttributeError):
+                pass
+        else:
+            parts.append(got.output.strip())
+    return Result(True, "\n".join(p for p in parts if p) or "could not read the OS version")
+
+
+def _bluetooth_report(executor) -> "Result":
+    if not Path("/sys/class/bluetooth").exists():
+        return Result(True, "this machine has no bluetooth adapter")
+    parts = []
+    for label, argv in (("adapter", ["bluetoothctl", "--timeout", "3", "show"]),
+                        ("connected", ["bluetoothctl", "--timeout", "3",
+                                       "devices", "Connected"])):
+        got = executor._shell(argv, timeout=8, limit=1200)
+        if got.ok and got.output.strip():
+            parts.append(f"{label}:\n{got.output.strip()}")
+    return Result(True, "\n\n".join(parts) or "the bluetooth adapter did not answer")
+
+
+SYSTEM_QUERIES["battery"] = lambda executor: executor._battery()
+SYSTEM_QUERIES["bluetooth"] = _bluetooth_report
+SYSTEM_QUERIES["os"] = _os_report
+
+
+def tools_for(config: Config) -> list[dict]:
+    """The schemas this configuration can actually run.
+
+    `run_shell` is off by default, and a tool that is always going to be
+    refused is worse than a tool that is not offered: it costs its schema on
+    every turn, and when the model reaches for it — which it does, it is the
+    one tool that can express anything — the refusal costs a whole round trip
+    before it tries the tool it should have used.
+    """
+    if config.allow_shell:
+        return list(TOOL_SCHEMAS)
+    return [schema for schema in TOOL_SCHEMAS if schema["name"] != "run_shell"]
+
+
 _BARE_ADDRESS_RE = re.compile(r'(window\s*=\s*")(0x[0-9a-fA-F]+)(")')
+# `key = "..."` inside a raw hl.dsp.send_shortcut, so a chord written by hand
+# through hypr_dispatch gets the same keysym check as the send_shortcut tool.
+_LUA_KEY_RE = re.compile(r'(\bkey\s*=\s*")([^"]*)(")')
+_LUA_MODS_RE = re.compile(r'(\bmods\s*=\s*")([^"]*)(")')
+
+
+def _wait_description(what: str, value: str) -> str:
+    return {
+        "text": f"{value!r} appeared on screen",
+        "window": f"a window matching {value!r} opened",
+        "window_gone": f"the window matching {value!r} closed",
+    }[what]
+
+
+def _wait_timeout(what: str, value: str) -> str:
+    return {
+        "text": f"{value!r} still is not on screen",
+        "window": f"no window matching {value!r} has opened",
+        "window_gone": f"the window matching {value!r} is still open",
+    }[what]
+
+
+def _matching_lines(text: str, query: str, context: int = 1) -> str:
+    """The lines of `text` that answer `query`, with a line either side.
+
+    A screenful of OCR is a couple of thousand tokens charged against a
+    per-minute budget. When the question is "what is the price" the answer is
+    one line, and sending the other ninety costs the user a turn.
+    """
+    wanted = [w for w in re.split(r"\W+", query.lower()) if w]
+    lines = text.splitlines()
+    if not wanted or not lines:
+        return ""
+    keep: set[int] = set()
+    for index, line in enumerate(lines):
+        lowered = line.lower()
+        hits = sum(1 for w in wanted if w in lowered)
+        if hits >= _required_hits(len(wanted)):
+            keep.update(range(max(0, index - context),
+                              min(len(lines), index + context + 1)))
+    if not keep:
+        return ""
+    out, previous = [], None
+    for index in sorted(keep):
+        if previous is not None and index > previous + 1:
+            out.append("…")
+        out.append(lines[index])
+        previous = index
+    return "\n".join(out).strip()
+
+
+def _chord(mods: str, key: str) -> str:
+    """"CTRL SHIFT" + "Return" -> "CTRL+SHIFT+Return"; a bare key stays bare."""
+    parts = [p for p in (mods or "").replace("+", " ").split() if p]
+    return "+".join([*parts, key])
+
+
+def _normalise_shortcut_lua(lua: str) -> tuple[str, str | None]:
+    """Fix the key and mods in a hand-written send_shortcut, or say why not.
+
+    hypr_dispatch is the back door to every dispatcher, send_shortcut included,
+    so the keysym check has to live on this path too — otherwise "Enter" is
+    still a silent no-op as long as the model spells the Lua out itself.
+    """
+    if "send_shortcut" not in lua:
+        return lua, None
+    error: str | None = None
+
+    def replace(pattern, normalise):
+        nonlocal error, lua
+        match = pattern.search(lua)
+        if match is None:
+            return
+        value, problem = normalise(match.group(2))
+        if problem:
+            error = error or problem
+            return
+        lua = lua[:match.start(2)] + value + lua[match.end(2):]
+
+    replace(_LUA_MODS_RE, normalise_mods)
+    replace(_LUA_KEY_RE, normalise_key)
+    return lua, error
+
 
 
 def _normalise_window_addresses(lua: str) -> str:
@@ -591,7 +1042,41 @@ def normalise_omarchy(command: str) -> tuple[list[str], str | None]:
             f"{', '.join(placeholders)} is a placeholder from the command signature, "
             "not a value. Replace it with a real one — a window pattern is a short "
             'word matching the window, e.g. "x" for x.com.')
+    if error := _misused_launch_browser(argv):
+        return argv, error
     return argv, None
+
+
+def _misused_launch_browser(argv: list[str]) -> str | None:
+    """Refuse `omarchy launch browser <url>`, naming the tool that works.
+
+    The manifest lists `omarchy launch browser [url]`, read off the live
+    system, so the model reaches for it — and it is the wrong shape for an
+    assistant. It hands the URL to the running browser, which opens a TAB in a
+    window that already exists: nothing new appears in hyprctl, so there is no
+    window to wait for, read, scroll, move or close. In the session log that is
+    exactly what happened — "I don't see the Google results; the active window
+    is still the OpenAI usage page. The search page didn't appear."
+
+    Persona wording did not beat the manifest here; a refusal that names the
+    right call at the moment of the mistake does, which is the same fix already
+    used for hl.dsp.workspace.change_id.
+    """
+    if argv[:2] != ["launch", "browser"]:
+        return None
+    urls = [a for a in argv[2:] if urlparse(a).scheme.lower() in ("http", "https")]
+    if not urls:
+        return None  # "open my browser" is a perfectly good request
+    url = urls[0]
+    query = parse_qs(urlparse(url).query).get("q", [""])[0]
+    if query:
+        return (f"that is a search URL. Use web_search with query={query!r} — it opens "
+                "the results as their own window, which this does not: `omarchy launch "
+                "browser <url>` opens a tab inside an existing window, so no new window "
+                "appears and you cannot read or verify it.")
+    return (f"use open_page with url={url!r} instead. `omarchy launch browser <url>` "
+            "opens a tab inside a window that already exists, so nothing new appears in "
+            "the window list and you cannot wait for it, read it, or tell if it worked.")
 
 
 def _misused_change_id(expr: str) -> str | None:
@@ -625,6 +1110,8 @@ class Executor:
         self.on_action = on_action or (lambda name, desc: None)
         self.pending: tuple[str, dict] | None = None
         self.transcript: list[str] = []
+        # The window the last web_search opened, so the next one can replace it.
+        self._last_search_window: str | None = None
         self._lock = threading.Lock()
 
     # -- dispatch -----------------------------------------------------------
@@ -711,16 +1198,48 @@ class Executor:
         if name == "launch_app":
             return f'launch {args.get("app", "")}{" " + args["url"] if args.get("url") else ""}'
         if name == "send_shortcut":
-            return f'press {args.get("mods", "")}+{args.get("key", "")} in {args.get("window", "")}'
+            # Report the keysym that will actually be pressed, not the word the
+            # model said: the log is the only record of what hit the window.
+            mods = normalise_mods(args.get("mods", ""))[0]
+            keysym = normalise_key(args.get("key", ""))[0]
+            chord = _chord(mods if mods is not None else args.get("mods", ""),
+                           keysym or args.get("key", ""))
+            return f'press {chord} in {args.get("window", "")}'
         if name == "type_text":
             return f'type {args.get("text", "")!r}'
+        if name == "hypr_query":
+            return f'query hyprctl {args.get("kind", "")}'
         if name == "omarchy_help":
             return f'look up omarchy command {args.get("query", "")!r}'
         if name == "click_text":
             kind = "double-click" if args.get("double") else "click"
             return f'{kind} {args.get("button", "left")} on {args.get("text", "")!r}'
         if name == "read_screen":
-            return f'read screen ({args.get("target", "screen")})'
+            where = args.get("target", "screen")
+            if query := (args.get("query") or "").strip():
+                return f'read screen ({where}) looking for {query!r}'
+            return f'read screen ({where})'
+        if name == "scroll":
+            return (f'scroll {args.get("target", "activewindow")} '
+                    f'{args.get("direction", "")} x{args.get("amount", 1)}')
+        if name == "wait_for":
+            return f'wait for {args.get("what", "")} {args.get("value", "")!r}'
+        if name == "clipboard":
+            if args.get("action") == "write":
+                return f'copy to clipboard: {str(args.get("text", ""))[:60]!r}'
+            return "read the clipboard"
+        if name == "web_search":
+            scope = args.get("scope", "web")
+            return f'search the {scope} for {args.get("query", "")!r}'
+        if name == "open_page":
+            return f'open {args.get("url", "")}'
+        if name == "system_query":
+            return f'look up system {args.get("topic", "")}'
+        if name == "remember":
+            action = args.get("action", "")
+            if action == "list":
+                return "read the notebook"
+            return f'{action} note {str(args.get("text", ""))[:60]!r}'
         if name == "compose_windows":
             panes = args.get("panes") or []
             labels = ", ".join(
@@ -817,13 +1336,18 @@ class Executor:
                     "to use it, or launch apps with launch_app / omarchy_cli")
         if error := _misused_change_id(expr):
             return error
+        if error := _normalise_shortcut_lua(expr)[1]:
+            return error
         return None
 
     def _tool_hypr_dispatch(self, lua: str) -> Result:
         error = self._validate_hypr_dispatch(lua)
         if error:
             return Result(False, error)
-        return self._dispatch_lua(_normalise_window_addresses(lua.strip()))
+        expr, error = _normalise_shortcut_lua(_normalise_window_addresses(lua.strip()))
+        if error:
+            return Result(False, error)
+        return self._dispatch_lua(expr)
 
     def _dispatch_lua(self, lua: str) -> Result:
         """Run one dispatcher, treating "not found" as the failure it is.
@@ -839,12 +1363,35 @@ class Executor:
             return Result(False, first.strip())
         return result
 
+    def _validate_send_shortcut(self, mods: str, key: str,
+                                window: str = "activewindow") -> str | None:
+        return normalise_mods(mods)[1] or normalise_key(key)[1]
+
     def _tool_send_shortcut(self, mods: str, key: str, window: str = "activewindow") -> Result:
+        """Press a chord, having first checked the keys exist.
+
+        Hyprland answers `ok` for a keysym it cannot resolve and presses
+        nothing, so `key = "Enter"` — the word a person actually says — was a
+        silent no-op that the model then reported as done. Both halves are
+        resolved here, and an unresolvable one is an error the model can read.
+        """
+        clean_mods, error = normalise_mods(mods)
+        if error:
+            return Result(False, error)
+        keysym, error = normalise_key(key)
+        if error:
+            return Result(False, error)
         lua = (
-            f'hl.dsp.send_shortcut({{ mods = {json.dumps(mods)}, '
-            f'key = {json.dumps(key)}, window = {json.dumps(window)} }})'
+            f'hl.dsp.send_shortcut({{ mods = {json.dumps(clean_mods)}, '
+            f'key = {json.dumps(keysym)}, window = {json.dumps(window)} }})'
         )
-        return self._dispatch_lua(lua)
+        result = self._dispatch_lua(lua)
+        # Say so when the name was translated, but not for a mere case fold —
+        # "read 'T' as t" is noise the model would repeat out loud.
+        if result.ok and keysym.lower() != (key or "").strip().lower():
+            return Result(True, f"pressed {_chord(clean_mods, keysym)} "
+                                f"(read {key!r} as {keysym})")
+        return result
 
     def _validate_omarchy_cli(self, command: str) -> str | None:
         return normalise_omarchy(command)[1]
@@ -956,8 +1503,8 @@ class Executor:
         for tool, package in (("grim", "grim"), ("tesseract", "tesseract")):
             if not shutil.which(tool):
                 return Result(False, f"{tool} is not installed (pacman -S {package})")
-        if asleep := self._screen_is_awake():
-            return Result(False, asleep)
+        if blocked := self._screen_unavailable():
+            return Result(False, blocked)
         try:
             shot = subprocess.run(["grim", "-g", geometry, "-"],
                                   capture_output=True, timeout=15)
@@ -983,15 +1530,30 @@ class Executor:
             text = text[:OCR_LIMIT] + "\n… [more text on screen, not read]"
         return Result(True, text)
 
-    def _screen_is_awake(self) -> str | None:
-        """Why the screen cannot be captured right now, or None if it can.
+    def _screen_unavailable(self) -> str | None:
+        """Why the screen cannot be read or pointed at, or None if it can.
 
-        grim copies frames from the compositor, and a monitor in DPMS off is not
-        producing any — the capture does not fail, it blocks until the timeout.
-        Reading the screen at 00:30 therefore hung for fifteen seconds and then
-        reported an OCR failure, when the honest answer is that the display is
-        asleep and nobody is looking at it.
+        Two ways to get pixels that are not the desktop:
+
+        * A monitor in DPMS off produces no frames at all. grim does not fail on
+          one, it blocks until the timeout — a read at half past midnight hung
+          for fifteen seconds and then blamed OCR.
+        * A locked session paints the lock screen over everything. That one is
+          worse, because the capture succeeds: grim returns the wallpaper and a
+          password box, so "read me the news" came back with whatever OCR made
+          of a blurred photograph, reported as the news. Nothing in hyprctl
+          shows it — an ext-session-lock surface is not a layer, no locker
+          process is running under a recognisable name, and logind's LockedHint
+          stays "no" — but Omarchy's own shell, which draws the lock, will say.
+
+        Neither check is allowed to be the reason nothing works: if the query
+        does not answer, the capture is attempted anyway.
         """
+        if self._session_is_locked():
+            return ("the session is locked, so the only thing on screen is the "
+                    "lock screen. Ask the user to unlock it; do not try to read "
+                    "or click through it, and do not report the lock screen as "
+                    "the contents of their desktop.")
         monitors = self._query_json("monitors")
         if not monitors:
             return None  # cannot tell; let the capture try
@@ -1002,6 +1564,23 @@ class Executor:
         return ("the display is asleep, so there is nothing on screen to read. "
                 "Wake it first with hypr_dispatch: "
                 'hl.dsp.dpms({ state = "on" })')
+
+    def _session_is_locked(self) -> bool:
+        """Whether the lock screen is covering the desktop.
+
+        Only Omarchy's shell knows. It draws the lock itself through
+        ext-session-lock, which is not a layer surface, runs under no process
+        named for locking, and leaves logind's LockedHint at "no" — so hyprctl,
+        ps and loginctl all report an ordinary unlocked desktop while a
+        password box is the only thing being painted.
+
+        Not `-q`: that is omarchy-shell's best-effort mode and it suppresses the
+        answer along with the errors, which reads as "not locked".
+        """
+        if not shutil.which("omarchy-shell"):
+            return False
+        answer = self._shell(["omarchy-shell", "lock", "isLocked"], timeout=4)
+        return answer.ok and answer.output.strip().lower() == "true"
 
     def _ocr_words(self, geometry: str) -> tuple[list[dict], str]:
         """OCR a region into positioned words: [{text, x, y, w, h, conf}, ...].
@@ -1014,8 +1593,8 @@ class Executor:
         for tool in ("grim", "tesseract"):
             if not shutil.which(tool):
                 return [], f"{tool} is not installed"
-        if asleep := self._screen_is_awake():
-            return [], asleep
+        if blocked := self._screen_unavailable():
+            return [], blocked
         try:
             origin_x, origin_y = (int(v) for v in geometry.split()[0].split(","))
         except (ValueError, IndexError):
@@ -1142,7 +1721,17 @@ class Executor:
             return pressed
         return Result(True, f'{"double-" if double else ""}clicked {text!r} at {x},{y}')
 
-    def _tool_read_screen(self, target: str = "screen") -> Result:
+    def _tool_read_screen(self, target: str = "screen", query: str = "") -> Result:
+        result = self._read_screen_text(target)
+        if not result.ok or not (query or "").strip():
+            return result
+        found = _matching_lines(result.output, query)
+        if not found:
+            return Result(True, f"nothing on screen matches {query!r}. It may be below "
+                                "the fold — scroll and look again — or simply not there.")
+        return Result(True, found)
+
+    def _read_screen_text(self, target: str = "screen") -> Result:
         target = (target or "screen").strip()
 
         if target in ("screen", "", "monitor", "all"):
@@ -1313,6 +1902,19 @@ class Executor:
                                   workspace: str = "next") -> str | None:
         if not isinstance(panes, list) or not panes:
             return "panes must be a non-empty list"
+        if len(panes) == 1:
+            # A layout tool asked to lay out one window is a tell: the request
+            # was a question, not a workspace. The model kept reaching here for
+            # "who won the race" and "show me pictures of a duck" because this
+            # is the habitual route to anything on the web, and persona wording
+            # did not move it. Refusing at the point of the mistake does.
+            pane = panes[0] if isinstance(panes[0], dict) else {}
+            target = str(pane.get("target", ""))
+            return ("compose_windows lays several windows out together; for one window "
+                    "it is the wrong tool. If this is a question — a price, a result, a "
+                    "date, or \"show me\" — call web_search, which puts the answer on the "
+                    "workspace the user is already looking at. If you want this exact "
+                    f"page, call open_page{f' with url={target!r}' if target else ''}.")
         if len(panes) > MAX_PANES:
             return f"at most {MAX_PANES} panes; more than that is unreadable on one screen"
         if layout not in LAYOUTS:
@@ -1384,6 +1986,12 @@ class Executor:
             address = self._await_new_window(
                 before, budget, _pane_hint(kind, str(pane.get("target", "")),
                                            str(pane.get("name", ""))))
+            # Chrome raises its profile-error box when a second browser process
+            # races the first for the profile's databases, which is exactly what
+            # launching panes back to back does. Clear it between panes so it
+            # cannot steal the focus the next preselect depends on.
+            if kind == "web":
+                self._dismiss_browser_error_dialogs()
             placed.append(address)
             if address is None:
                 # Still coming, probably. Say so rather than claiming it is up.
@@ -1437,3 +2045,460 @@ class Executor:
         if not self.config.allow_shell:
             return Result(False, "shell access is disabled in config (allow_shell = false)")
         return self._shell(["bash", "-lc", command], timeout=30)
+
+    # -- the web ------------------------------------------------------------
+    def _open_web_window(self, url: str, hint: str,
+                         timeout: float = WEB_WINDOW_TIMEOUT) -> tuple[dict | None, str]:
+        """Open `url` as its own window and hand back the client, or say why not.
+
+        `omarchy launch webapp` is deliberate: it is `chrome --app=<url>`, which
+        makes a real window rather than a tab in one that already exists. A tab
+        is invisible to hyprctl, so there is no way to wait for it, read it,
+        move it or close it — the assistant that opened one was left guessing
+        whether anything had happened, and guessed wrong.
+        """
+        before = {c.get("address") for c in self._query_json("clients")}
+        launched = self._shell(["omarchy", "launch", "webapp", url],
+                               timeout=20, grace=LAUNCH_GRACE)
+        if not launched.ok:
+            return None, f"could not open the browser: {launched.output}"
+        address = self._await_new_window(before, timeout, hint)
+        if address is None:
+            return None, ("the browser did not open a window within "
+                          f"{timeout:.0f}s. Say so rather than assuming it worked.")
+        self._dismiss_browser_error_dialogs()
+        window = next((c for c in self._query_json("clients")
+                       if c.get("address") == address), None)
+        if window is None:
+            return None, "the window opened and then went away again"
+        return window, ""
+
+    def _read_web_window(self, window: dict, settle: float = WEB_RENDER_SETTLE) -> Result:
+        """OCR a freshly opened page, once it has had a moment to paint.
+
+        A window is mapped well before it has drawn anything. Reading straight
+        away returns a blank page, which is indistinguishable from a page with
+        nothing on it — so an empty or very short read is retried once.
+        """
+        time.sleep(settle)
+        try:
+            geometry = (f'{window["at"][0]},{window["at"][1]} '
+                        f'{window["size"][0]}x{window["size"][1]}')
+        except (KeyError, IndexError, TypeError):
+            return Result(False, "could not read that window's geometry")
+        result = self._ocr_region(geometry)
+        if not result.ok or len(result.output) < 200:
+            time.sleep(settle)
+            retry = self._ocr_region(geometry)
+            if retry.ok and len(retry.output) > len(result.output if result.ok else ""):
+                result = retry
+        if result.ok and RESTORE_BUBBLE in result.output.lower():
+            return Result(True, result.output + (
+                "\n\n[Chromium is showing its \"Restore pages\" crash prompt over this "
+                "page. Dismiss it with click_text on \"Restore\" or \"No thanks\", or "
+                "send_shortcut Escape, then read again — what is above is partly that "
+                "prompt, not the page.]"))
+        return result
+
+    def _dismiss_browser_error_dialogs(self) -> int:
+        """Close Chrome's "Profile error occurred" boxes. See PROFILE_ERROR_TITLE.
+
+        Matched on an empty class *and* the title, so this can only ever take
+        down an unclassed dialog — never a real window, whatever it is called.
+        """
+        closed = 0
+        for client in self._query_json("clients"):
+            if client.get("class"):
+                continue
+            if PROFILE_ERROR_TITLE in (client.get("title") or "").lower():
+                self._dispatch_lua(
+                    f'hl.dsp.window.close({{ window = "address:{client["address"]}" }})')
+                closed += 1
+        return closed
+
+    def _close_last_search(self) -> bool:
+        """Take down the window the previous search opened, if it is still up.
+
+        Tracked by address rather than matched by class: the class of a Google
+        results pane is indistinguishable from one the user asked for by name,
+        and closing a window somebody wanted is a worse failure than leaving a
+        stale one behind.
+        """
+        address = self._last_search_window
+        self._last_search_window = None
+        if not address:
+            return False
+        if not any(c.get("address") == address for c in self._query_json("clients")):
+            return False
+        self._dispatch_lua(f'hl.dsp.window.close({{ window = "address:{address}" }})')
+        time.sleep(0.4)
+        return True
+
+    def _validate_web_search(self, query: str, scope: str = "web") -> str | None:
+        if not (query or "").strip():
+            return "query is required — say what to search for"
+        if scope not in SEARCH_SCOPES:
+            return f"scope must be one of {', '.join(SEARCH_SCOPES)}"
+        return None
+
+    def _tool_web_search(self, query: str, scope: str = "web") -> Result:
+        if error := self._validate_web_search(query, scope):
+            return Result(False, error)
+        query = " ".join(query.split())
+        url = SEARCH_SCOPES[scope].format(q=quote_plus(query))
+        self._close_last_search()
+        window, why = self._open_web_window(url, urlparse(url).hostname or "")
+        if window is None:
+            return Result(False, why)
+        address = window["address"]
+        self._last_search_window = address
+
+        if scope in VISUAL_SCOPES:
+            return Result(True, f"{scope} for {query!r} are on screen now "
+                                f"(window address:{address}). They are pictures, so tell "
+                                "the user to look rather than describing them from OCR.")
+        read = self._read_web_window(window)
+        if not read.ok:
+            return Result(True, f"the results for {query!r} are on screen "
+                                f"(window address:{address}) but could not be read: "
+                                f"{read.output}")
+        return Result(True,
+                      f"results for {query!r} (window address:{address}, and on screen "
+                      f"for the user to see):\n\n{read.output}\n\n"
+                      "This is OCR of a results page, so quote it rather than embroidering "
+                      "it, and scroll or click_text on the window to go further.")
+
+    def _validate_open_page(self, url: str, read: bool = True) -> str | None:
+        if urlparse(url or "").scheme.lower() not in ("http", "https"):
+            return "url must be an http or https address"
+        return None
+
+    def _tool_open_page(self, url: str, read: bool = True) -> Result:
+        if error := self._validate_open_page(url, read):
+            return Result(False, error)
+        host = urlparse(url).hostname or ""
+        window, why = self._open_web_window(url, host[4:] if host.startswith("www.") else host)
+        if window is None:
+            return Result(False, why)
+        address = window["address"]
+        if not read:
+            return Result(True, f"opened {url} (window address:{address})")
+        got = self._read_web_window(window)
+        if not got.ok:
+            return Result(True, f"opened {url} (window address:{address}) but could not "
+                                f"read it: {got.output}")
+        return Result(True, f"opened {url} (window address:{address}):\n\n{got.output}")
+
+    # -- reach: scrolling ---------------------------------------------------
+    def _window_geometry(self, target: str) -> tuple[dict | None, str]:
+        """The client `target` names, or (None, why not)."""
+        clients = self._query_json("clients")
+        if not clients:
+            return None, "nothing is open"
+        if target in ("", "activewindow", "active", "focused"):
+            window = next((c for c in clients if c.get("focusHistoryID") == 0), None)
+            if window is None:
+                return None, "nothing is focused"
+            return window, ""
+        address = target[8:] if target.startswith("address:") else target
+        window = next((c for c in clients if c.get("address") == address), None)
+        if window is None:
+            return None, (f"no window with address {address!r} — call "
+                          "hypr_query(clients) for current addresses")
+        return window, ""
+
+    def _validate_scroll(self, direction: str, amount: int = 1,
+                         target: str = "activewindow") -> str | None:
+        if direction not in SCROLL_SIGN:
+            return f"direction must be one of {', '.join(SCROLL_SIGN)}"
+        try:
+            amount = int(amount)
+        except (TypeError, ValueError):
+            return "amount must be a whole number of screens"
+        if amount < 1:
+            return "amount must be at least 1"
+        return None
+
+    def _tool_scroll(self, direction: str, amount: int = 1,
+                     target: str = "activewindow") -> Result:
+        """Turn the wheel over a window.
+
+        Pointing at the window first is not decoration: a wheel event goes to
+        whatever is under the cursor, so without the move, "scroll the article"
+        scrolled whichever pane the mouse happened to be resting on — and in a
+        composed workspace that is usually the wrong one.
+        """
+        if error := self._validate_scroll(direction, amount, target):
+            return Result(False, error)
+        amount = min(int(amount), SCROLL_MAX_PAGES)
+        window, why = self._window_geometry(target)
+        if window is None:
+            return Result(False, why)
+
+        if blocked := self._screen_unavailable():
+            return Result(False, blocked)
+        workspace = str((window.get("workspace") or {}).get("name"))
+        if workspace not in self._visible_workspaces():
+            return Result(False, f"that window is on workspace {workspace}, which is not "
+                                 "on screen, so there is nothing to scroll. Switch to it "
+                                 "first with hl.dsp.focus.")
+        try:
+            x = window["at"][0] + window["size"][0] // 2
+            y = window["at"][1] + window["size"][1] // 2
+        except (KeyError, IndexError, TypeError):
+            return Result(False, "could not read that window's geometry")
+
+        title = (window.get("title") or window.get("class") or "the window")[:40]
+        if not shutil.which("ydotool"):
+            # Keys reach further than nothing. Page_Down only works where the
+            # page itself has focus, so say which route was taken — if it did
+            # not move, that is the reason.
+            key = {"down": "Page_Down", "up": "Page_Up",
+                   "right": "Right", "left": "Left"}[direction]
+            pressed = self._tool_send_shortcut("", key,
+                                               f'address:{window["address"]}')
+            if not pressed.ok:
+                return pressed
+            return Result(True, f"pressed {key} {amount}x on {title} (ydotool is not "
+                                "installed, so this used keys rather than the wheel; "
+                                "it only scrolls if the page itself has focus)")
+
+        moved = self._dispatch_lua(f'hl.dsp.cursor.move({{ x = {x}, y = {y} }})')
+        if not moved.ok:
+            return Result(False, f"could not point at the window: {moved.output}")
+        span = window["size"][0] if direction in ("left", "right") else window["size"][1]
+        clicks = _scroll_clicks(span, amount) * SCROLL_SIGN[direction]
+        axis = "-x" if direction in ("left", "right") else "-y"
+        other = "-y" if axis == "-x" else "-x"
+        turned = self._shell(["ydotool", "mousemove", "--wheel",
+                              axis, str(clicks), other, "0"], timeout=10)
+        if not turned.ok:
+            if "uinput" in turned.output.lower():
+                return Result(False, CLICK_UNAVAILABLE)
+            return turned
+        screens = "a screen" if amount == 1 else f"{amount} screens"
+        return Result(True, f"scrolled {title} {direction} about {screens}. "
+                            "Read it again to see what is there now.")
+
+    # -- patience: waiting for something to happen --------------------------
+    def _validate_wait_for(self, what: str, value: str, timeout: float = WAIT_DEFAULT) -> str | None:
+        if what not in ("text", "window", "window_gone"):
+            return 'what must be "text", "window" or "window_gone"'
+        if not (value or "").strip():
+            return "value is required — say what you are waiting for"
+        try:
+            float(timeout)
+        except (TypeError, ValueError):
+            return "timeout must be a number of seconds"
+        return None
+
+    def _tool_wait_for(self, what: str, value: str,
+                       timeout: float = WAIT_DEFAULT) -> Result:
+        """Poll until the condition holds, and say how long it took.
+
+        A timeout here is a finding, not a failure: "the page did not load in
+        ten seconds" is something the user wants said out loud, and it is much
+        better than reading a stale screen and reporting its contents as new.
+        """
+        if error := self._validate_wait_for(what, value, timeout):
+            return Result(False, error)
+        limit = max(0.5, min(float(timeout), WAIT_MAX))
+        started = time.monotonic()
+        gap = WAIT_POLL_TEXT if what == "text" else WAIT_POLL_WINDOW
+        last_error = ""
+
+        while True:
+            if what == "text":
+                monitors = self._query_json("monitors")
+                screen = next((m for m in monitors if m.get("focused")), None) \
+                    or (monitors[0] if monitors else None)
+                if screen is None:
+                    return Result(False, "no monitor to look at")
+                geometry = (f'{screen.get("x", 0)},{screen.get("y", 0)} '
+                            f'{screen.get("width", 0)}x{screen.get("height", 0)}')
+                words, last_error = self._ocr_words(geometry)
+                if last_error:
+                    return Result(False, last_error)
+                found = self._find_phrase(words, value) is not None
+            else:
+                clients = self._query_json("clients")
+                exists = any(_window_matches(c, value) for c in clients)
+                found = exists if what == "window" else not exists
+
+            waited = time.monotonic() - started
+            if found:
+                return Result(True, f"{_wait_description(what, value)} after "
+                                    f"{waited:.1f}s. Carry on.")
+            if waited + gap >= limit:
+                return Result(True, f"waited {limit:.0f}s and {_wait_timeout(what, value)}. "
+                                    "That is what happened — say so, or look with "
+                                    "read_screen before deciding what to do next.")
+            time.sleep(gap)
+
+    # -- exact text: the clipboard ------------------------------------------
+    def _validate_clipboard(self, action: str, text: str = "") -> str | None:
+        if action not in ("read", "write"):
+            return 'action must be "read" or "write"'
+        if action == "write" and not (text or "").strip():
+            return "text is required to write to the clipboard"
+        return None
+
+    def _tool_clipboard(self, action: str, text: str = "") -> Result:
+        if error := self._validate_clipboard(action, text):
+            return Result(False, error)
+        if action == "write":
+            if not shutil.which("wl-copy"):
+                return Result(False, "wl-copy is not installed (pacman -S wl-clipboard)")
+            # Not one pipe between here and wl-copy. It forks a process that
+            # holds the selection until something else takes it, and that child
+            # inherits our file descriptors: with stderr on a pipe, reading to
+            # EOF meant waiting for a process designed to outlive us, so a copy
+            # that had already worked was reported as a ten-second timeout.
+            # A file has no such problem — the parent exits, we read it after.
+            with tempfile.TemporaryFile() as errors:
+                try:
+                    done = subprocess.run(["wl-copy", "--", text],
+                                          stdin=subprocess.DEVNULL,
+                                          stdout=subprocess.DEVNULL, stderr=errors,
+                                          timeout=10)
+                except (OSError, subprocess.SubprocessError) as exc:
+                    return Result(False, f"could not write the clipboard: {exc}")
+                if done.returncode != 0:
+                    errors.seek(0)
+                    detail = errors.read().decode(errors="replace").strip()
+                    return Result(False, detail or "wl-copy failed")
+            return Result(True, f"copied {len(text)} characters to the clipboard")
+
+        if not shutil.which("wl-paste"):
+            return Result(False, "wl-paste is not installed (pacman -S wl-clipboard)")
+        got = self._shell(["wl-paste", "--no-newline", "--type", "text/plain"],
+                          timeout=10, limit=CLIPBOARD_LIMIT)
+        if not got.ok:
+            # wl-paste exits non-zero on an empty selection and on one holding
+            # only an image, and the two read very differently to a user. Its
+            # own words for empty are "Nothing is copied".
+            lowered = got.output.lower()
+            if "empty" in lowered or "nothing is copied" in lowered:
+                return Result(True, "the clipboard is empty")
+            return Result(True, "the clipboard does not hold any text "
+                                f"({got.output.strip() or 'no text/plain offer'})")
+        if not got.output.strip():
+            return Result(True, "the clipboard is empty")
+        return got
+
+    # -- the machine about itself -------------------------------------------
+    def _tool_system_query(self, topic: str) -> Result:
+        """Read-only facts, from a fixed list of commands.
+
+        Deliberately not run_shell. Every one of these is a question people ask
+        out loud — "how much space is left", "am I still on wifi" — and none of
+        them is worth making someone open the shell tool for, which would hand
+        an open microphone the whole command line at the same time.
+        """
+        recipe = SYSTEM_QUERIES.get(topic)
+        if recipe is None:
+            return Result(False, f"unknown topic {topic!r}. Choose one of: "
+                                 + ", ".join(sorted(SYSTEM_QUERIES)))
+        if callable(recipe):
+            return recipe(self)
+        parts = []
+        for label, argv, *cap in recipe:
+            if not shutil.which(argv[0]):
+                continue
+            got = self._shell(argv, timeout=10, limit=1200)
+            if not got.ok or not got.output.strip():
+                continue
+            body = got.output.strip()
+            if cap:
+                body = "\n".join(body.splitlines()[:cap[0]])
+            parts.append(f"{label}:\n{body}" if label else body)
+        if not parts:
+            return Result(False, f"nothing on this machine could answer {topic!r}")
+        return Result(True, "\n\n".join(parts))
+
+    def _battery(self) -> Result:
+        """/sys rather than upower, because the answer is often "there isn't one"."""
+        root = Path("/sys/class/power_supply")
+        try:
+            supplies = sorted(root.iterdir())
+        except OSError:
+            supplies = []
+        rows = []
+        for entry in supplies:
+            def read(name: str) -> str:
+                try:
+                    return (entry / name).read_text().strip()
+                except OSError:
+                    return ""
+            if read("type").lower() == "battery":
+                percent, status = read("capacity"), read("status")
+                rows.append(f"{entry.name}: {percent or '?'}% ({status or 'unknown'})")
+            elif read("type").lower() == "mains" and read("online") == "1":
+                rows.append(f"{entry.name}: on mains power")
+        if not rows:
+            return Result(True, "this machine has no battery — it is a desktop, "
+                                "always on mains power")
+        return Result(True, "\n".join(rows))
+
+    # -- the notebook -------------------------------------------------------
+    def _notes_path(self) -> Path:
+        from .config import STATE_DIR
+        return STATE_DIR / "notes.json"
+
+    def _read_notes(self) -> list[dict]:
+        try:
+            data = json.loads(self._notes_path().read_text())
+        except (OSError, json.JSONDecodeError):
+            return []
+        return [n for n in data if isinstance(n, dict) and n.get("text")] \
+            if isinstance(data, list) else []
+
+    def _write_notes(self, notes: list[dict]) -> str | None:
+        path = self._notes_path()
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(json.dumps(notes[-NOTES_LIMIT:], indent=1))
+            path.chmod(0o600)
+        except OSError as exc:
+            return f"could not write the notes: {exc}"
+        return None
+
+    def _validate_remember(self, action: str, text: str = "") -> str | None:
+        if action not in ("note", "list", "forget"):
+            return 'action must be "note", "list" or "forget"'
+        if action == "note" and not (text or "").strip():
+            return "text is required — say what to write down"
+        if action == "forget" and not (text or "").strip():
+            return 'text is required — words identifying the note, or "all"'
+        return None
+
+    def _tool_remember(self, action: str, text: str = "") -> Result:
+        if error := self._validate_remember(action, text):
+            return Result(False, error)
+        notes = self._read_notes()
+
+        if action == "list":
+            if not notes:
+                return Result(True, "the notebook is empty")
+            return Result(True, "\n".join(
+                f'{n.get("when", "?")}  {n["text"]}' for n in notes))
+
+        if action == "forget":
+            if text.strip().lower() == "all":
+                kept, dropped = [], len(notes)
+            else:
+                wanted = [w for w in re.split(r"\W+", text.lower()) if w]
+                kept = [n for n in notes
+                        if not all(w in n["text"].lower() for w in wanted)]
+                dropped = len(notes) - len(kept)
+            if not dropped:
+                return Result(False, f"no note matches {text!r}; nothing was forgotten")
+            if error := self._write_notes(kept):
+                return Result(False, error)
+            return Result(True, f"forgot {dropped} note(s)")
+
+        line = " ".join(text.split())[:NOTE_LENGTH_LIMIT]
+        notes.append({"when": time.strftime("%Y-%m-%d %H:%M"), "text": line})
+        if error := self._write_notes(notes):
+            return Result(False, error)
+        return Result(True, f"noted. {len(notes[-NOTES_LIMIT:])} note(s) in the notebook")

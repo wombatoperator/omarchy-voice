@@ -301,7 +301,13 @@ def live_state() -> str:
 # re-checks them, and `doctor` reports any that a system update has broken.
 ESSENTIALS = [
     ("Open a terminal",            "omarchy launch terminal"),
-    ("Open the browser",           "omarchy launch browser [url]"),
+    # Deliberately without the [url] the CLI accepts. Given the URL form, the
+    # model reached for it every time — and it hands the address to the running
+    # browser, which opens a TAB in a window that already exists. Nothing new
+    # appears in hyprctl, so the assistant cannot wait for it, read it, or tell
+    # whether it worked, and in the session log it concluded (wrongly) that the
+    # launch had failed. Advertising the route was teaching the mistake.
+    ("Open the browser (no URL — see below)", "omarchy launch browser"),
     ("Open the editor",            "omarchy launch editor"),
     ("Open the file manager",      "omarchy launch nautilus"),
     ("Open a web app, or focus it if already open",
@@ -318,6 +324,16 @@ ESSENTIALS = [
     ("Change the theme",           "omarchy theme set <theme-name>   (omarchy theme list)"),
     ("Dismiss a notification",     "omarchy notification dismiss <summary>"),
 ]
+
+# Said right after the table, where the browser row is still in view.
+WEB_NOTE = (
+    "To put a web page on screen use the TOOLS, not the CLI: web_search(query) "
+    "for anything you need to look up, open_page(url) for one specific address. "
+    "Both open a window you can then read, scroll and click. `omarchy launch "
+    "browser <url>` only opens a tab inside an existing window, which never "
+    "appears in the window list, and the web panes here are Chromium app "
+    "windows with no address bar to type into."
+)
 
 # A second window of an already-running app. `omarchy launch ...` and a plain
 # launch_app both focus what is already open, which is right for "open my
@@ -398,7 +414,8 @@ def hypr_essentials() -> str:
 
 
 def essentials() -> str:
-    return "\n".join(f"  {what:<44} {how}" for what, how in ESSENTIALS)
+    rows = "\n".join(f"  {what:<44} {how}" for what, how in ESSENTIALS)
+    return f"{rows}\n\n  {WEB_NOTE}"
 
 
 def verify_hypr_essentials() -> list[str]:
@@ -504,9 +521,17 @@ gives you with omarchy_cli. Do not guess a route you have not seen.
 
 
 def _cache_key() -> str:
+    """What the cached manifest is keyed on.
+
+    The system inputs, and *this file*. Without the last one, editing the
+    template or the essentials table changed nothing: the daemon went on
+    serving a manifest built before the change, from a cache whose key only
+    moved when Omarchy or Hyprland did. That cost an hour of wondering why a
+    corrected instruction was not reaching the model.
+    """
     versions = system_versions()
     stamp = json.dumps(versions, sort_keys=True)
-    for path in (HL_STUB, OMARCHY_PATH / "default/hypr/bindings"):
+    for path in (HL_STUB, OMARCHY_PATH / "default/hypr/bindings", Path(__file__)):
         try:
             stamp += str(path.stat().st_mtime_ns)
         except OSError:

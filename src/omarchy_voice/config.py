@@ -132,7 +132,12 @@ class Config:
     # --- openai ------------------------------------------------------------
     planner_model: str = "gpt-4.1"
     api_key_env: str = "OPENAI_API_KEY"
-    max_turns: int = 8
+    # Tool rounds allowed on one spoken instruction before the assistant has to
+    # be asked again. A goal worked properly is a loop — act, wait, look, act —
+    # so 8 ran out halfway through anything with three steps in it and the user
+    # had to say "carry on". Each round costs a turn against the per-minute
+    # token budget, which is why this is 12 and not 30.
+    max_turns: int = 12
 
     # --- ears --------------------------------------------------------------
     # There is no mode. Listening is off when the daemon starts and only the

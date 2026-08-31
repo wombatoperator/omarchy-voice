@@ -39,7 +39,7 @@ from .config import Config, CONFIG_DIR, ENV_FILE, SAFETY_ID_FILE
 from .feedback import Feedback
 from .persona import PERSONA
 from .session import ControlServer, _matches
-from .tools import TOOL_SCHEMAS, Executor
+from .tools import TOOL_SCHEMAS, Executor, tools_for
 
 REALTIME_URL = "wss://api.openai.com/v1/realtime"
 
@@ -117,7 +117,14 @@ adds a second of speech before anything moves, and if the call then fails you
 have already told the user something untrue.
 
 Speak first ONLY when the tool will visibly take a while — `compose_windows`,
-or anything opening several applications. One short line, then the call.
+`wait_for`, or anything opening several applications. One short line, then the
+call.
+
+Working towards a goal takes several rounds, and the user hears nothing during
+them. Say what you are setting off to do before the first step, and say what
+happened at the end. Do not narrate every step in between — a running
+commentary is as bad as silence — but never go more than a few actions without
+a word.
 
 # Speaking is not doing
 
@@ -424,7 +431,7 @@ class RealtimeSession:
                     },
                 },
                 "instructions": await self._instructions(),
-                "tools": to_realtime_tools(),
+                "tools": to_realtime_tools(tools_for(self.config)),
                 "tool_choice": "auto",
             },
         }

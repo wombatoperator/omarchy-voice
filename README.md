@@ -150,6 +150,59 @@ alongside everything else. Declining costs you nothing but the spelling —
 >
 > "open a new tab" · "search this page for pipewire" · "save the file"
 
+> "how much disk space have I got left?" · "what's making the fan spin?" ·
+> "am I still on wifi?" · "what time is it?"
+>
+> "scroll down and read me the rest" · "copy that link and tell me what it
+> says" · "does it say anything about pipewire?" · "wait for the build to
+> finish, then tell me if it passed"
+
+### Searching
+
+Oma has a search engine, and the results land on your screen rather than in a
+token stream:
+
+```
+you   "how much is a bitcoin worth right now"
+      → web_search({ query = "current Bitcoin price in USD" })
+it    "It shows Bitcoin at about 79,148 dollars and 79 cents."
+```
+
+The query goes in the **URL** and the results open as their own window. Nothing
+is typed, which matters more than it sounds: the web panes on an Omarchy desktop
+are `chrome --app=<url>` windows with no tab bar and no address bar, so `CTRL+T`
+and `CTRL+L` are no-ops and there is nowhere for a typed query to go. A session
+log of the assistant discovering that, the hard way, is in `HANDOFF.md`.
+
+`scope` picks the page: `web` (Google, whose answer panel often answers outright),
+`news`, `images`, `videos`, or `duckduckgo` for a plain list of links. `images`
+and `videos` are not read back — you asked to see them, so it says so and leaves
+them on screen.
+
+`open_page(url)` is the same mechanism for one specific address. Prefer both over
+`omarchy launch browser <url>`, which opens a tab inside a window that already
+exists: nothing new appears in `hyprctl`, so it cannot be waited for, read, or
+verified. Oma is told this, and the tool refuses it with the right call named.
+
+### Going after a goal
+
+The interesting requests are not one action. "Get me to that pull request and
+tell me what changed" is a loop — do a thing, look at what happened, decide
+what is next — and the tools are shaped so that loop can actually close:
+
+| Tool | The wall it removes |
+|---|---|
+| `scroll` | The screen shows one screenful. What is below the fold does not exist to `read_screen` or `click_text` until you scroll to it. |
+| `wait_for` | Pages load, applications start. Reading a moment too early shows you the previous screen — and it gets reported as the new one. |
+| `clipboard` | OCR guesses at pixels. A URL, an error, a code has to be right to the character; the clipboard is exact. |
+| `system_query` | "How much space is left", "am I on wifi", "why is the fan loud" are questions about the machine, not about a window. Read-only, no shell. |
+| `remember` | When listening is toggled off the conversation is gone. This is the only memory a goal spanning two sittings has. |
+| `web_search` / `open_page` | Anything you do not know or cannot see. Results open as a real window — visible to you, and readable, scrollable and clickable by her. |
+| `read_screen(query=…)` | A screenful of OCR is a couple of thousand tokens. Ask for the line you need and pay for the line you need. |
+
+`max_turns` (default 12) is how many tool rounds one spoken instruction gets
+before Oma stops and waits to be asked again.
+
 ### Asking for a task, not an application
 
 Name a subject rather than a program and it builds a workspace for it:
@@ -181,7 +234,7 @@ So the size of the prompt *is* how many things you can say in a minute:
 omarchy-voice manifest | wc -c     # the biggest part of it
 ```
 
-At the default 40,000 TPM and roughly 8,200 tokens a turn, that is about five
+At the default 40,000 TPM and roughly 10,200 tokens a turn, that is about four
 turns a minute. Past that the API starts refusing responses; the daemon waits
 the interval the server names and asks again rather than going quiet, but it
 cannot make the budget bigger. If Oma feels like it is pausing between
@@ -190,6 +243,15 @@ sentences, that is what is happening — check your tier at
 
 `tools/bench_realtime.py` measures time-to-first-action across realtime models
 on this machine.
+
+Reach costs tokens. The tools above add about 2,000 to every turn — roughly one
+turn a minute — which is the price of Oma being able to finish a multi-step job
+instead of stopping at the first thing she cannot see. It is a better trade than
+it looks: the session that could not search burned **twelve** tool rounds failing
+to, which is two minutes of budget for no answer. The same question now costs one
+round and eight seconds. `run_shell` is no longer
+sent at all unless `allow_shell = true`, since a tool that will only ever be
+refused costs its schema every turn and a whole round trip when reached for.
 
 ## Safety
 
@@ -204,6 +266,10 @@ not trusted blindly:
   `launch_app` command lines. Apps launch by desktop id; URLs must be
   `http(s)`. `allow_shell = true` is the only way around that.
 - **Off by default**: the shell tool.
+- **Leaves the machine**: `read_screen` sends a picture of the screen, and
+  `clipboard` read sends whatever you last copied. Both go to OpenAI along with
+  the audio. `read_screen` and `click_text` refuse outright when the session is
+  locked, so a lock screen is never captured or clicked through.
 
 Confirmation is not the model's to grant:
 

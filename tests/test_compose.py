@@ -167,11 +167,44 @@ class ComposePolicyTests(unittest.TestCase):
              mock.patch.object(executor, "_query_json", return_value=[]), \
              mock.patch.object(executor, "_shell") as shell:
             result = executor.call("compose_windows", {
-                "panes": [{"kind": "web", "target": "https://apnews.com", "name": "AP News"}],
+                "panes": [{"kind": "web", "target": "https://apnews.com", "name": "AP News"},
+                          {"kind": "web", "target": "https://reuters.com", "name": "Reuters"}],
                 "workspace": "current"})
         self.assertFalse(result.ok)
         self.assertIn("policy", result.output)
         shell.assert_not_called()
+
+
+class SinglePaneTests(unittest.TestCase):
+    """A layout tool asked to lay out one window means the request was a
+    question, not a workspace. The model kept coming here for "who won the
+    race" because this was the habitual route to anything on the web."""
+
+    def setUp(self):
+        self.executor = Executor(Config())
+
+    def test_one_pane_is_refused_and_names_the_right_tool(self):
+        result = self.executor.call("compose_windows", {
+            "panes": [{"kind": "web", "target": "https://f1.com", "name": "F1"}]})
+        self.assertFalse(result.ok)
+        self.assertIn("web_search", result.output)
+        self.assertIn("open_page", result.output)
+
+    def test_the_refusal_carries_the_url_so_open_page_is_one_step_away(self):
+        result = self.executor.call("compose_windows", {
+            "panes": [{"kind": "web", "target": "https://f1.com", "name": "F1"}]})
+        self.assertIn("https://f1.com", result.output)
+
+    def test_two_panes_are_still_a_composition(self):
+        with mock.patch.object(self.executor, "_query_json", return_value=[]), \
+             mock.patch.object(self.executor, "_dispatch_lua", return_value=Result(True, "ok")), \
+             mock.patch.object(self.executor, "_shell", return_value=Result(True, "started")), \
+             mock.patch.object(self.executor, "_await_new_window", return_value=None):
+            result = self.executor.call("compose_windows", {
+                "panes": [{"kind": "web", "target": "https://a.test", "name": "A"},
+                          {"kind": "web", "target": "https://b.test", "name": "B"}],
+                "workspace": "current"})
+        self.assertTrue(result.ok)
 
 
 class ComposeRunTests(unittest.TestCase):
@@ -185,7 +218,8 @@ class ComposeRunTests(unittest.TestCase):
              mock.patch.object(executor, "_shell", return_value=Result(True, "started")), \
              mock.patch.object(executor, "_await_new_window", return_value=None):
             result = executor.call("compose_windows", {
-                "panes": [{"kind": "terminal", "target": "", "name": "shell"}],
+                "panes": [{"kind": "terminal", "target": "", "name": "shell"},
+                          {"kind": "terminal", "target": "", "name": "logs"}],
                 "workspace": "current"})
         self.assertTrue(result.ok)
         self.assertIn("shell", result.output)
@@ -307,8 +341,13 @@ class ReadScreenTests(unittest.TestCase):
         self.assertIn("hypr_query", result.output)
 
     def test_a_screenful_of_text_is_capped(self):
+        # _screen_unavailable is stubbed because it asks the real hyprctl through
+        # Popen, which subprocess.run does not cover: with the monitor in DPMS
+        # off this test used to fail on the sleeping-display refusal instead of
+        # on anything to do with the cap.
         from omarchy_voice.tools import OCR_LIMIT
-        with mock.patch("subprocess.run") as run:
+        with mock.patch.object(self.executor, "_screen_unavailable", return_value=None), \
+             mock.patch("subprocess.run") as run:
             run.side_effect = [
                 mock.Mock(returncode=0, stdout=b"PNG", stderr=b""),
                 mock.Mock(returncode=0, stdout=b"x" * (OCR_LIMIT * 2), stderr=b""),
@@ -435,6 +474,13 @@ class SleepingScreenTests(unittest.TestCase):
 
     def setUp(self):
         self.executor = Executor(Config())
+        # The lock probe shells out to the real omarchy-shell. These tests are
+        # about DPMS, and on a machine whose session happens to be locked they
+        # would otherwise all fail on the lock refusal instead.
+        locked = mock.patch.object(self.executor, "_session_is_locked",
+                                   return_value=False)
+        locked.start()
+        self.addCleanup(locked.stop)
 
     def test_a_sleeping_display_is_reported_not_captured(self):
         with mock.patch.object(self.executor, "_query_json",
@@ -449,12 +495,12 @@ class SleepingScreenTests(unittest.TestCase):
     def test_an_awake_display_captures_normally(self):
         with mock.patch.object(self.executor, "_query_json",
                                return_value=[{"name": "HDMI-A-1", "dpmsStatus": True}]):
-            self.assertIsNone(self.executor._screen_is_awake())
+            self.assertIsNone(self.executor._screen_unavailable())
 
     def test_one_awake_monitor_is_enough(self):
         with mock.patch.object(self.executor, "_query_json", return_value=[
                 {"dpmsStatus": False}, {"dpmsStatus": True}]):
-            self.assertIsNone(self.executor._screen_is_awake())
+            self.assertIsNone(self.executor._screen_unavailable())
 
     def test_clicking_a_sleeping_screen_is_refused(self):
         with mock.patch.object(self.executor, "_query_json", side_effect=lambda k: {

@@ -18,7 +18,7 @@ from dataclasses import dataclass, field
 from . import capabilities
 from .config import Config
 from .persona import PERSONA
-from .tools import TOOL_SCHEMAS, Executor
+from .tools import TOOL_SCHEMAS, Executor, tools_for
 
 CHAT_URL = "https://api.openai.com/v1/chat/completions"
 
@@ -90,7 +90,7 @@ class Planner:
             {"role": "system", "content": _system_prompt()},
             {"role": "user", "content": text},
         ]
-        tools = to_chat_tools()
+        tools = to_chat_tools(tools_for(self.config))
         reply = ""
 
         for _ in range(self.config.max_turns):
