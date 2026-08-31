@@ -342,6 +342,31 @@ class ClickByTextTests(unittest.TestCase):
     def setUp(self):
         self.executor = Executor(Config())
 
+    def test_half_the_words_is_not_a_match(self):
+        # "Files changed" used to match the prose "changed files and file tree"
+        # elsewhere on the page and click it, confidently, in the wrong place.
+        words = [
+            {"text": "changed", "x": 10, "y": 400, "w": 50, "h": 12, "conf": 90},
+            {"text": "documents", "x": 70, "y": 400, "w": 60, "h": 12, "conf": 90},
+        ]
+        self.assertIsNone(self.executor._find_phrase(words, "Files changed"))
+
+    def test_a_short_query_needs_every_word(self):
+        from omarchy_voice.tools import _required_hits
+        self.assertEqual(_required_hits(1), 1)
+        self.assertEqual(_required_hits(2), 2)
+        self.assertEqual(_required_hits(3), 3)
+
+    def test_a_long_query_tolerates_one_ocr_miss(self):
+        from omarchy_voice.tools import _required_hits
+        self.assertEqual(_required_hits(5), 4)
+
+    def test_ocr_uses_automatic_page_segmentation(self):
+        # psm 6 assumes one uniform block and read straight past the tab bar of
+        # a GitHub pull request; psm 3 segments the page and finds it.
+        from omarchy_voice.tools import OCR_PAGE_MODE
+        self.assertEqual(OCR_PAGE_MODE, 3)
+
     def test_a_phrase_is_found_despite_a_misread_word(self):
         point = self.executor._find_phrase(self.WORDS, "US and Iran trade strikes")
         self.assertIsNotNone(point)

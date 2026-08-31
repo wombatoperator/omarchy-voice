@@ -113,10 +113,23 @@ OUTPUT_LIMIT = 4000
 # every turn is charged against a per-minute budget, so a screen's worth of
 # text has to be bounded.
 OCR_LIMIT = 6000
+# tesseract page segmentation. 6 means "one uniform block of text", which is
+# what omarchy-capture-text uses because there a human has dragged a box around
+# a paragraph. A whole screen is not that: it is a bar, a sidebar, tabs and a
+# page in columns, and psm 6 read straight past them — it could not see the
+# "Files changed" tab on a GitHub pull request at all, while psm 3 (automatic
+# segmentation) finds it and reads more of everything else too.
+OCR_PAGE_MODE = 3
 # Words tesseract is less sure of than this are noise, not targets.
 MIN_OCR_CONFIDENCE = 45.0
-# A phrase has to match this fraction of its words to count as found.
-PHRASE_MATCH_FLOOR = 0.5
+def _required_hits(word_count: int) -> int:
+    """How many of a query's words must be present for a run to count.
+
+    All of them for anything short. A long phrase gets one word of slack,
+    because OCR reliably mangles about that many and losing the whole match to
+    one misread letter is worse than the occasional near-miss.
+    """
+    return word_count if word_count <= 3 else word_count - 1
 # ydotool button codes: 0xC0 is press+release, +1 right, +2 middle.
 YDOTOOL_BUTTONS = {"left": "0xC0", "right": "0xC1", "middle": "0xC2"}
 CLICK_UNAVAILABLE = (
@@ -955,7 +968,7 @@ class Executor:
                           or "screen capture produced nothing")
         try:
             ocr = subprocess.run(
-                ["tesseract", "stdin", "stdout", "--oem", "1", "--psm", "6",
+                ["tesseract", "stdin", "stdout", "--oem", "1", "--psm", str(OCR_PAGE_MODE),
                  "-l", os.environ.get("OMARCHY_OCR_LANGS", "eng"), "--dpi", "300",
                  "-c", "preserve_interword_spaces=1"],
                 input=shot.stdout, capture_output=True, timeout=45)
@@ -1013,7 +1026,7 @@ class Executor:
             if shot.returncode != 0 or not shot.stdout:
                 return [], "screen capture produced nothing"
             ocr = subprocess.run(
-                ["tesseract", "stdin", "stdout", "--oem", "1", "--psm", "6",
+                ["tesseract", "stdin", "stdout", "--oem", "1", "--psm", str(OCR_PAGE_MODE),
                  "-l", os.environ.get("OMARCHY_OCR_LANGS", "eng"), "--dpi", "300", "tsv"],
                 input=shot.stdout, capture_output=True, timeout=45)
         except (OSError, subprocess.SubprocessError) as exc:
@@ -1057,13 +1070,18 @@ class Executor:
                     continue
                 text = " ".join(w["text"].lower() for w in run)
                 hits = sum(1 for w in wanted if w in text)
-                if not hits:
+                # Every word has to be there, give or take one for a long phrase
+                # that OCR has mangled. Accepting half of them meant a two-word
+                # target passed on a single word: asked for "Files changed" on a
+                # pull request it matched the words "changed files" in the body
+                # prose and clicked that, confidently, in the wrong place.
+                if hits < _required_hits(len(wanted)):
                     continue
-                # Prefer runs where more of the query landed, then tighter runs.
-                score = hits / len(wanted) - 0.01 * abs(len(run) - span_len)
+                # Among runs that qualify, prefer the tightest one.
+                score = hits / len(wanted) - 0.05 * abs(len(run) - span_len)
                 if score > best_score:
                     best_score, best_span = score, run
-        if best_span is None or best_score < PHRASE_MATCH_FLOOR:
+        if best_span is None:
             return None
         left = min(w["x"] for w in best_span)
         top = min(w["y"] for w in best_span)
