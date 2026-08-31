@@ -9,7 +9,7 @@
 |---|---|
 | Daemon | running as a systemd user service, `gpt-realtime-2.1` |
 | Prompt | ~6,900 tokens a turn, down from 9,350 |
-| Tests | 154 |
+| Tests | 158 |
 | Clicking | working end to end, verified against a live browser |
 
 ### Open pull requests to Omarchy
