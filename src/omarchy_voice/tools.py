@@ -113,6 +113,19 @@ OUTPUT_LIMIT = 4000
 # every turn is charged against a per-minute budget, so a screen's worth of
 # text has to be bounded.
 OCR_LIMIT = 6000
+# Words tesseract is less sure of than this are noise, not targets.
+MIN_OCR_CONFIDENCE = 45.0
+# A phrase has to match this fraction of its words to count as found.
+PHRASE_MATCH_FLOOR = 0.5
+# ydotool button codes: 0xC0 is press+release, +1 right, +2 middle.
+YDOTOOL_BUTTONS = {"left": "0xC0", "right": "0xC1", "middle": "0xC2"}
+CLICK_UNAVAILABLE = (
+    "clicking needs ydotool, which is not set up on this machine. Hyprland can "
+    "move the pointer but has no click dispatcher. Tell the user to run: "
+    "sudo pacman -S ydotool && sudo systemctl enable --now ydotoold. "
+    "Until then, drive the app with send_shortcut instead — most things that "
+    "can be clicked can also be reached with a key."
+)
 
 
 def _layout_plan(layout: str, count: int) -> list[tuple[str, int]]:
@@ -359,6 +372,33 @@ TOOL_SCHEMAS = [
                     ),
                 },
             },
+            "additionalProperties": False,
+        },
+    },
+    {
+        "name": "click_text",
+        "description": (
+            "Click something on screen by the words you can see on it — a headline, a "
+            "button, a link, a menu entry. Say the text, not coordinates: "
+            "click_text(text=\"Continue\") or click_text(text=\"US and Iran trade "
+            "strikes\", double=True). It reads the screen, finds those words, puts the "
+            "pointer on them and clicks. "
+            "Only what is visible can be clicked, so switch to the right workspace first. "
+            "If you are not sure of the exact wording, call read_screen and use words that "
+            "actually came back. Prefer send_shortcut when a keyboard shortcut does the "
+            "same job — it is faster and cannot miss."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "text": {"type": "string",
+                         "description": "The visible text to click, e.g. \"Continue\"."},
+                "button": {"type": "string", "enum": ["left", "right", "middle"],
+                           "description": "Default left."},
+                "double": {"type": "boolean",
+                           "description": "True to double-click, e.g. to open an item."},
+            },
+            "required": ["text"],
             "additionalProperties": False,
         },
     },
@@ -663,6 +703,9 @@ class Executor:
             return f'type {args.get("text", "")!r}'
         if name == "omarchy_help":
             return f'look up omarchy command {args.get("query", "")!r}'
+        if name == "click_text":
+            kind = "double-click" if args.get("double") else "click"
+            return f'{kind} {args.get("button", "left")} on {args.get("text", "")!r}'
         if name == "read_screen":
             return f'read screen ({args.get("target", "screen")})'
         if name == "compose_windows":
@@ -900,6 +943,8 @@ class Executor:
         for tool, package in (("grim", "grim"), ("tesseract", "tesseract")):
             if not shutil.which(tool):
                 return Result(False, f"{tool} is not installed (pacman -S {package})")
+        if asleep := self._screen_is_awake():
+            return Result(False, asleep)
         try:
             shot = subprocess.run(["grim", "-g", geometry, "-"],
                                   capture_output=True, timeout=15)
@@ -924,6 +969,160 @@ class Executor:
         if len(text) > OCR_LIMIT:
             text = text[:OCR_LIMIT] + "\n… [more text on screen, not read]"
         return Result(True, text)
+
+    def _screen_is_awake(self) -> str | None:
+        """Why the screen cannot be captured right now, or None if it can.
+
+        grim copies frames from the compositor, and a monitor in DPMS off is not
+        producing any — the capture does not fail, it blocks until the timeout.
+        Reading the screen at 00:30 therefore hung for fifteen seconds and then
+        reported an OCR failure, when the honest answer is that the display is
+        asleep and nobody is looking at it.
+        """
+        monitors = self._query_json("monitors")
+        if not monitors:
+            return None  # cannot tell; let the capture try
+        awake = [m for m in monitors
+                 if m.get("dpmsStatus") is not False and not m.get("disabled")]
+        if awake:
+            return None
+        return ("the display is asleep, so there is nothing on screen to read. "
+                "Wake it first with hypr_dispatch: "
+                'hl.dsp.dpms({ state = "on" })')
+
+    def _ocr_words(self, geometry: str) -> tuple[list[dict], str]:
+        """OCR a region into positioned words: [{text, x, y, w, h, conf}, ...].
+
+        tesseract's `tsv` output carries a bounding box per word, which is the
+        whole reason clicking by text is possible. Coordinates come back
+        relative to the captured image, so the region's own origin is added
+        back on to get screen coordinates.
+        """
+        for tool in ("grim", "tesseract"):
+            if not shutil.which(tool):
+                return [], f"{tool} is not installed"
+        if asleep := self._screen_is_awake():
+            return [], asleep
+        try:
+            origin_x, origin_y = (int(v) for v in geometry.split()[0].split(","))
+        except (ValueError, IndexError):
+            return [], "could not read the capture geometry"
+        try:
+            shot = subprocess.run(["grim", "-g", geometry, "-"],
+                                  capture_output=True, timeout=15)
+            if shot.returncode != 0 or not shot.stdout:
+                return [], "screen capture produced nothing"
+            ocr = subprocess.run(
+                ["tesseract", "stdin", "stdout", "--oem", "1", "--psm", "6",
+                 "-l", os.environ.get("OMARCHY_OCR_LANGS", "eng"), "--dpi", "300", "tsv"],
+                input=shot.stdout, capture_output=True, timeout=45)
+        except (OSError, subprocess.SubprocessError) as exc:
+            return [], f"OCR failed: {exc}"
+
+        words = []
+        for line in (ocr.stdout or b"").decode(errors="replace").splitlines()[1:]:
+            cell = line.split("\t")
+            if len(cell) < 12 or not cell[11].strip():
+                continue
+            try:
+                conf = float(cell[10])
+                if conf < MIN_OCR_CONFIDENCE:
+                    continue
+                words.append({"text": cell[11].strip(),
+                              "x": origin_x + int(cell[6]), "y": origin_y + int(cell[7]),
+                              "w": int(cell[8]), "h": int(cell[9]), "conf": conf})
+            except ValueError:
+                continue
+        return words, ""
+
+    @staticmethod
+    def _find_phrase(words: list[dict], query: str) -> tuple[int, int] | None:
+        """Centre of the best run of words matching `query`, or None.
+
+        Matched as a sliding window over consecutive words rather than a string
+        search, because OCR splits a headline into words and drops the odd one.
+        A run scores by how many of the query's words it contains, so
+        "US and Iran trade strikes" still finds the headline when tesseract read
+        "trade" as "frade".
+        """
+        wanted = [w for w in re.split(r"\W+", query.lower()) if w]
+        if not wanted or not words:
+            return None
+        best_score, best_span = 0.0, None
+        span_len = max(1, len(wanted))
+        for start in range(len(words)):
+            for length in (span_len, span_len + 1, max(1, span_len - 1)):
+                run = words[start:start + length]
+                if not run:
+                    continue
+                text = " ".join(w["text"].lower() for w in run)
+                hits = sum(1 for w in wanted if w in text)
+                if not hits:
+                    continue
+                # Prefer runs where more of the query landed, then tighter runs.
+                score = hits / len(wanted) - 0.01 * abs(len(run) - span_len)
+                if score > best_score:
+                    best_score, best_span = score, run
+        if best_span is None or best_score < PHRASE_MATCH_FLOOR:
+            return None
+        left = min(w["x"] for w in best_span)
+        top = min(w["y"] for w in best_span)
+        right = max(w["x"] + w["w"] for w in best_span)
+        bottom = max(w["y"] + w["h"] for w in best_span)
+        return (left + right) // 2, (top + bottom) // 2
+
+    def _press_button(self, button: str, double: bool) -> Result:
+        """The actual click. Hyprland has no click dispatcher, so this is ydotool."""
+        if not shutil.which("ydotool"):
+            return Result(False, CLICK_UNAVAILABLE)
+        code = YDOTOOL_BUTTONS.get(button)
+        if code is None:
+            return Result(False, f"button must be one of {', '.join(YDOTOOL_BUTTONS)}")
+        cmd = ["ydotool", "click"] + (["--repeat", "2"] if double else []) + [code]
+        result = self._shell(cmd, timeout=10)
+        if not result.ok and "uinput" in result.output.lower():
+            return Result(False, CLICK_UNAVAILABLE)
+        return result
+
+    def _validate_click_text(self, text: str, button: str = "left",
+                             double: bool = False) -> str | None:
+        if not (text or "").strip():
+            return "text is required — say what is on screen that you want clicked"
+        if button not in YDOTOOL_BUTTONS:
+            return f"button must be one of {', '.join(YDOTOOL_BUTTONS)}"
+        return None
+
+    def _tool_click_text(self, text: str, button: str = "left",
+                         double: bool = False) -> Result:
+        error = self._validate_click_text(text, button, double)
+        if error:
+            return Result(False, error)
+        monitors = self._query_json("monitors")
+        screen = next((m for m in monitors if m.get("focused")), None) \
+            or (monitors[0] if monitors else None)
+        if not screen:
+            return Result(False, "no monitor to look at")
+        try:
+            geometry = f'{screen["x"]},{screen["y"]} {screen["width"]}x{screen["height"]}'
+        except KeyError:
+            return Result(False, "could not read the monitor geometry")
+
+        words, error = self._ocr_words(geometry)
+        if error:
+            return Result(False, error)
+        point = self._find_phrase(words, text)
+        if point is None:
+            return Result(False,
+                          f"could not find {text!r} on screen. Read the screen first and "
+                          "use wording you can actually see, or scroll it into view.")
+        x, y = point
+        moved = self._dispatch_lua(f'hl.dsp.cursor.move({{ x = {x}, y = {y} }})')
+        if not moved.ok:
+            return Result(False, f"could not move the pointer: {moved.output}")
+        pressed = self._press_button(button, double)
+        if not pressed.ok:
+            return pressed
+        return Result(True, f'{"double-" if double else ""}clicked {text!r} at {x},{y}')
 
     def _tool_read_screen(self, target: str = "screen") -> Result:
         target = (target or "screen").strip()

@@ -13,8 +13,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
 from omarchy_voice.config import Config
 from omarchy_voice.tools import (
-    Executor, Result, _layout_plan, _misused_change_id, _pane_command, _pane_hint,
-    _window_matches, normalise_omarchy,
+    CLICK_UNAVAILABLE, Executor, Result, _layout_plan, _misused_change_id,
+    _pane_command, _pane_hint, _window_matches, normalise_omarchy,
 )
 
 
@@ -322,6 +322,124 @@ class ReadScreenTests(unittest.TestCase):
         # Read-only, like hypr_query: --dry-run must still be able to look.
         from omarchy_voice.tools import READ_ONLY_TOOLS
         self.assertIn("read_screen", READ_ONLY_TOOLS)
+
+
+class ClickByTextTests(unittest.TestCase):
+    """Clicking by coordinates is useless to someone talking. The request that
+    prompted this was "double-click into this US and Iran trade strikes"."""
+
+    # A headline OCR'd into words, with one word misread ("frade").
+    WORDS = [
+        {"text": "Breaking", "x": 10, "y": 10, "w": 60, "h": 12, "conf": 90},
+        {"text": "US", "x": 100, "y": 50, "w": 20, "h": 12, "conf": 95},
+        {"text": "and", "x": 130, "y": 50, "w": 25, "h": 12, "conf": 95},
+        {"text": "Iran", "x": 160, "y": 50, "w": 30, "h": 12, "conf": 95},
+        {"text": "frade", "x": 195, "y": 50, "w": 35, "h": 12, "conf": 60},
+        {"text": "strikes", "x": 235, "y": 50, "w": 45, "h": 12, "conf": 92},
+        {"text": "Continue", "x": 400, "y": 300, "w": 70, "h": 14, "conf": 98},
+    ]
+
+    def setUp(self):
+        self.executor = Executor(Config())
+
+    def test_a_phrase_is_found_despite_a_misread_word(self):
+        point = self.executor._find_phrase(self.WORDS, "US and Iran trade strikes")
+        self.assertIsNotNone(point)
+        x, y = point
+        # Centre should land inside the headline's span, not on "Breaking".
+        self.assertTrue(100 <= x <= 280, x)
+        self.assertTrue(50 <= y <= 62, y)
+
+    def test_a_single_word_button_is_found(self):
+        x, y = self.executor._find_phrase(self.WORDS, "Continue")
+        self.assertTrue(400 <= x <= 470)
+        self.assertTrue(300 <= y <= 314)
+
+    def test_text_that_is_not_there_is_not_invented(self):
+        self.assertIsNone(self.executor._find_phrase(self.WORDS, "Delete everything"))
+
+    def test_no_words_no_match(self):
+        self.assertIsNone(self.executor._find_phrase([], "Continue"))
+
+    def test_empty_text_is_refused(self):
+        self.assertIsNotNone(self.executor._validate_click_text("  "))
+
+    def test_a_bad_button_is_refused(self):
+        self.assertIsNotNone(self.executor._validate_click_text("ok", button="scroll"))
+
+    def test_missing_text_reports_and_does_not_click(self):
+        with mock.patch.object(self.executor, "_query_json",
+                               return_value=[{"focused": True, "x": 0, "y": 0,
+                                              "width": 100, "height": 100}]), \
+             mock.patch.object(self.executor, "_ocr_words", return_value=(self.WORDS, "")), \
+             mock.patch.object(self.executor, "_press_button") as press:
+            result = self.executor.call("click_text", {"text": "Nonexistent Button"})
+        self.assertFalse(result.ok)
+        self.assertIn("could not find", result.output)
+        press.assert_not_called()
+
+    def test_a_hit_moves_the_pointer_then_clicks(self):
+        with mock.patch.object(self.executor, "_query_json",
+                               return_value=[{"focused": True, "x": 0, "y": 0,
+                                              "width": 500, "height": 500}]), \
+             mock.patch.object(self.executor, "_ocr_words", return_value=(self.WORDS, "")), \
+             mock.patch.object(self.executor, "_dispatch_lua",
+                               return_value=Result(True, "ok")) as move, \
+             mock.patch.object(self.executor, "_press_button",
+                               return_value=Result(True, "")) as press:
+            result = self.executor.call("click_text", {"text": "Continue", "double": True})
+        self.assertTrue(result.ok)
+        self.assertIn("cursor.move", move.call_args[0][0])
+        press.assert_called_once_with("left", True)
+
+    def test_without_ydotool_it_says_what_to_run(self):
+        with mock.patch("shutil.which", return_value=None):
+            result = self.executor._press_button("left", False)
+        self.assertFalse(result.ok)
+        self.assertIn("ydotool", result.output)
+        self.assertEqual(result.output, CLICK_UNAVAILABLE)
+
+    def test_low_confidence_words_are_dropped(self):
+        from omarchy_voice.tools import MIN_OCR_CONFIDENCE
+        self.assertGreater(MIN_OCR_CONFIDENCE, 0)
+
+
+class SleepingScreenTests(unittest.TestCase):
+    """grim blocks rather than failing when the monitor is in DPMS off, so a
+    read at half past midnight hung for the full timeout."""
+
+    def setUp(self):
+        self.executor = Executor(Config())
+
+    def test_a_sleeping_display_is_reported_not_captured(self):
+        with mock.patch.object(self.executor, "_query_json",
+                               return_value=[{"name": "HDMI-A-1", "dpmsStatus": False}]), \
+             mock.patch("subprocess.run") as run:
+            result = self.executor._ocr_region("0,0 100x100")
+        self.assertFalse(result.ok)
+        self.assertIn("asleep", result.output)
+        self.assertIn("dpms", result.output)
+        run.assert_not_called()
+
+    def test_an_awake_display_captures_normally(self):
+        with mock.patch.object(self.executor, "_query_json",
+                               return_value=[{"name": "HDMI-A-1", "dpmsStatus": True}]):
+            self.assertIsNone(self.executor._screen_is_awake())
+
+    def test_one_awake_monitor_is_enough(self):
+        with mock.patch.object(self.executor, "_query_json", return_value=[
+                {"dpmsStatus": False}, {"dpmsStatus": True}]):
+            self.assertIsNone(self.executor._screen_is_awake())
+
+    def test_clicking_a_sleeping_screen_is_refused(self):
+        with mock.patch.object(self.executor, "_query_json", side_effect=lambda k: {
+                "monitors": [{"focused": True, "x": 0, "y": 0, "width": 100,
+                              "height": 100, "dpmsStatus": False}]}[k]), \
+             mock.patch.object(self.executor, "_press_button") as press:
+            result = self.executor.call("click_text", {"text": "Continue"})
+        self.assertFalse(result.ok)
+        self.assertIn("asleep", result.output)
+        press.assert_not_called()
 
 
 class TruncationTests(unittest.TestCase):
