@@ -1,6 +1,74 @@
 # omarchy-voice — 0.3.0
 
-Composition, and the speed work that came out of reading the session log.
+**Status as of 2026-08-31.** 154 tests passing. Published at
+<https://github.com/wombatoperator/omarchy-voice> (MIT, public).
+
+## Where things stand
+
+| | |
+|---|---|
+| Daemon | running as a systemd user service, `gpt-realtime-2.1` |
+| Prompt | ~6,900 tokens a turn, down from 9,350 |
+| Tests | 154 |
+| Clicking | built and unit-tested; **blocked** on ydotool, see below |
+
+### Open pull requests to Omarchy
+
+* **[basecamp/omarchy#9319](https://github.com/basecamp/omarchy/pull/9319)** —
+  gives the Secret portal a provider so Chromium can open its password store.
+  +51, 3 files. This is the stronger of the two: it completes a fix Omarchy
+  already started (their migration `1784508556` says "on Hyprland the
+  xdg-desktop-portal Secret backend has no provider and fails"), and fixes and
+  hardening are what they actually merge from outside contributors.
+* **[basecamp/omarchy#9320](https://github.com/basecamp/omarchy/pull/9320)** —
+  adds `omarchy install service voice`. +54, 1 file, opt-in, nothing in the base
+  install. Lower odds by the evidence: every existing service installer was
+  written by DHH, and only one outsider feature PR merged in the last hundred.
+
+Neither is a prerequisite for anything here. Both stay on the public record
+whether or not they merge.
+
+### Blocked: clicking
+
+`click_text` is written and unit-tested but has never run end to end, because
+`ydotool` cannot open `/dev/uinput`. The package ships the rule that fixes it and
+the user is already in the `input` group; udev has just never applied it, and the
+`uinput` module is not loaded:
+
+```bash
+sudo modprobe uinput
+sudo udevadm control --reload-rules
+sudo udevadm trigger --name-match=uinput
+systemctl --user restart ydotool
+```
+
+`/dev/uinput` should then be `crw-rw---- root:input`. Note Arch ships a **user**
+service called `ydotool`, not a root `ydotoold`.
+
+## Clicking, and not inventing failures
+
+Two things came out of a real spoken session.
+
+Every `Return`, `Down` and `Tab` was reported as "that key didn't register" and
+retried three ways. The dispatcher was never broken — `hl.dsp.send_shortcut` and
+`wtype` both deliver those keys, verified byte for byte against a terminal in raw
+mode. What was wrong is that the model cannot feel a keypress land, so it
+narrated a failure it had not observed. The persona now says a tool that returned
+without an error did what it says, and to call `read_screen` when the effect
+actually matters. One press, one accurate sentence.
+
+And: *"double-click into this US and Iran trade strikes"*. Clicking by coordinate
+is useless to someone talking, so `click_text` takes the words instead.
+tesseract's TSV output carries a bounding box per word; the phrase is matched as
+a sliding window over consecutive words, so one misread word does not lose the
+headline. Hyprland moves the pointer, ydotool presses the button.
+
+`omarchy capture text` cannot do this job — it shells out to `slurp` for an
+interactive drag and writes to the clipboard rather than stdout.
+
+`read_screen` and `click_text` check DPMS first. grim does not fail on a sleeping
+monitor, it blocks until the timeout, so a read at half past midnight hung for
+fifteen seconds and then blamed OCR.
 
 ## Composing a workspace
 
@@ -21,16 +89,26 @@ second, because dwindle halves recursively: 1261/621/626 becomes 845/829/834.
 
 ## Speed
 
-Measured, not guessed. The numbers are for this machine at 40,000 TPM.
+Measured, not guessed. Figures are for this machine at the 40,000 TPM
+actually being enforced — see the tier note below.
 
 - **Nothing was reported when a turn failed.** `response.done` with status
   `failed` was dropped silently — no log line, no notification, no speech. The
   log has the user asking to switch workspace four times in a row and getting
   silence each time. Those were rate-limited responses.
-- **The org's limit is 40,000 tokens/minute and a turn costs ~8,200**, so about
-  five turns a minute. Cached tokens count in full. The daemon now waits the
-  interval the server names and retries twice before saying anything, which
+- **A turn costs ~8,200 tokens and the enforced limit is 40,000/minute**, so
+  about five turns a minute. Cached tokens count in full. The daemon now waits
+  the interval the server names and retries twice before saying anything, which
   turns most of those silences into a pause.
+- **The account is on tier 3 and is not being given tier 3 for realtime.**
+  `rate_limits.updated` reports `limit=800,000`, and the errors name a different
+  bucket than the model called: "Rate limit reached for gpt-realtime-2.1 **(for
+  limit gpt-4o-realtime)**", capped at 40,000. A deliberate 8-turn burst had 3
+  succeed and 5 fail, with `remaining` reported against 40,000. Both readings
+  reproduce. This looks like a legacy alias bucket that never got the tier
+  upgrade, and it is OpenAI's to fix — worth a support ticket quoting that
+  exact string. Until then the retry logic is load-bearing, and trimming the
+  prompt is the only lever on this side.
 - **The desktop snapshot no longer rewrites `instructions`.** It arrives as a
   conversation item instead, and the previous one is deleted. Rewriting the
   instructions re-prefilled ~9k unchanged tokens per turn; appending without
@@ -146,8 +224,9 @@ audio, and whatever else is on screen goes with it.
 ## Verify
 
 ```bash
+git clone https://github.com/wombatoperator/omarchy-voice
 cd omarchy-voice
-python3 -m unittest discover -s tests      # 111 tests
+python3 -m unittest discover -s tests      # 154 tests
 ./bin/omarchy-voice doctor
 ./bin/omarchy-voice --dry-run say "what's going on in the news today"
 python3 tools/bench_realtime.py            # costs API tokens
