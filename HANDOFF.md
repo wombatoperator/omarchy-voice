@@ -1,6 +1,6 @@
 # omarchy-voice — 0.3.0
 
-**Status as of 2026-08-31.** 327 tests passing. Published at
+**Status as of 2026-08-31.** 341 tests passing. Published at
 <https://github.com/wombatoperator/omarchy-voice> (MIT, public).
 
 ## Where things stand
@@ -9,7 +9,7 @@
 |---|---|
 | Daemon | running as a systemd user service, `gpt-realtime-2.1` |
 | Prompt | ~9,700 tokens a turn. No longer the constraint — see below |
-| Tests | 327 |
+| Tests | 341 |
 | Clicking | working end to end, verified against a live browser |
 
 ### Open pull requests to Omarchy
@@ -61,6 +61,78 @@ wording that appears once, or drive the app with `send_shortcut` instead.
 `ydotool mousemove --absolute` lands at twice the requested coordinates on this
 display, so positioning stays with `hl.dsp.cursor.move` and ydotool is only
 asked to press the button.
+
+## She was hearing herself
+
+The first long spoken session on **speakers** rather than headphones. It worked
+well, and one thing was quietly wrong throughout. The machine's microphone and
+line out are the same audio interface — a Focusrite Scarlett Solo, `HiFi__Mic1__
+source` in and `HiFi__Line__sink` out — both at 100%, with no echo cancellation
+loaded. Her voice left the room and came straight back into an open condenser
+mic, and the server's turn detection has no idea it is hers.
+
+Three separate proofs in one minute of log:
+
+```
+13:23:06  reply   'OH-mah, OH-mah, OH-mah.'
+13:23:06  error   response cancelled: turn_detected
+13:23:07  heard   '어마'                      <- her own name, transcribed as Korean
+13:23:08  reply   'Yes, I'm here.'            <- she answered herself
+```
+
+```
+13:23:54  reply   'I closed the terminal and reopened AP News, Reuters, and BBC News.'
+13:23:54  error   response cancelled: turn_detected   (x2)
+13:23:56  heard   'Workspace closed the terminal.'    <- her own sentence, as two turns
+13:23:57  heard   'and re...'
+13:23:59  reply   'I didn't catch the rest of that.'
+```
+
+```
+13:28:29  heard   'Бела.'
+13:28:30  action  press CTRL+r in activewindow        <- a phantom utterance ran something
+```
+
+That last one is why this is not merely untidy: once a fragment transcribes as
+something imperative, it is executed.
+
+**The fix is to stop sending microphone frames while she is speaking**, plus
+350 ms for the room to go quiet. `Speaker.write` books the real duration of
+each chunk it queues (PCM16 mono: `len/2/rate` seconds), so the gate knows when
+sound stops rather than when the queue empties — the model sends a reply far
+faster than it is spoken. `_drop_queued` clears the booking, so a genuine
+barge-in reopens the mic at once instead of waiting out audio that will never
+play.
+
+This costs the ability to interrupt her mid-sentence, which on speakers did not
+work anyway: she was the one doing the interrupting. `barge_in = true` gives it
+back for headphones or for PipeWire's echo canceller, and `doctor` warns if it
+is on with both ends on the same box. `share/echo-cancel.conf` is a working
+`libpipewire-module-echo-cancel` config, with `webrtc.analog_gain_control` off
+because it fights a hardware preamp.
+
+Counted in the log as `mic held N frames while speaking`, so this is visible
+rather than a silent drop.
+
+## Writing a two-line file took thirteen commands
+
+Also from that session, and this one is `run_in_terminal`'s fault. It refuses
+newlines — send-keys would deliver them as Enter presses — and said only "one
+command at a time; newlines are not sent". So the model reached for a heredoc,
+was refused, and **retried the same heredoc five times** before working its way
+to `printf` one fragment at a time: thirteen commands and forty-five seconds
+for a shebang and an echo, with a broken intermediate file along the way.
+
+The refusal now names the pattern that works (`printf '...\n...' > f`, append
+with `>>`), which is the same "refuse with the right call named" fix that got
+`web_search` used over `omarchy launch browser`. The persona rule about not
+retrying a failing thing twice was already live and did not fire; a refusal
+that says what to do instead is worth more than a rule saying what not to do.
+
+Unresolved from the same session: "discard it" for a file she had just created
+was blocked by the `rm` deny pattern. She offered to rename or move it instead,
+which is a reasonable recovery, but deleting a file the assistant made a minute
+earlier is arguably not what that rule is for.
 
 ## The rate limit was real, and is gone
 
@@ -619,7 +691,7 @@ audio, and whatever else is on screen goes with it.
 ```bash
 git clone https://github.com/wombatoperator/omarchy-voice
 cd omarchy-voice
-python3 -m unittest discover -s tests      # 327 tests
+python3 -m unittest discover -s tests      # 341 tests
 ./bin/omarchy-voice doctor
 ./bin/omarchy-voice --dry-run say "what's going on in the news today"
 python3 tools/bench_realtime.py            # costs API tokens

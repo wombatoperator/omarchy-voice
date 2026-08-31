@@ -190,6 +190,15 @@ class RunningTests(unittest.TestCase):
         result = FakeTmux().call("run_in_terminal", {"command": "ls\nrm -rf /"})
         self.assertFalse(result.ok)
 
+    def test_the_refusal_names_the_way_that_does_work(self):
+        """Given only "newlines are not sent", the model retried the same
+        heredoc five times, then took thirteen commands and forty-five seconds
+        to write a two-line file."""
+        result = FakeTmux().call("run_in_terminal",
+                                 {"command": "cat > f <<EOF\nhello\nEOF"})
+        self.assertIn("printf", result.output)
+        self.assertIn(">>", result.output)
+
     def test_the_deny_list_still_applies(self):
         ex = FakeTmux()
         result = ex.call("run_in_terminal", {"command": "sudo rm -rf /"})

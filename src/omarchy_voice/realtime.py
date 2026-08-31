@@ -43,6 +43,13 @@ from .tools import TOOL_SCHEMAS, Executor, tools_for
 
 REALTIME_URL = "wss://api.openai.com/v1/realtime"
 
+# How long after her own audio stops before the microphone counts again.
+# Speakers and a room both lag: the tail is PipeWire's buffer plus however long
+# the reflection takes to die. Without it the last syllable of a reply comes
+# back through the mic a moment after playback "ended" and reopens the gate on
+# her own voice.
+ECHO_TAIL_SECONDS = 0.35
+
 # 100 ms of 24 kHz mono PCM16. Small enough that turn detection feels immediate,
 # large enough that we are not sending a websocket frame every few milliseconds.
 FRAME_BYTES = 4800
@@ -268,6 +275,14 @@ class Speaker:
         # a task nobody else is waiting on.
         self._queue: asyncio.Queue[bytes] = asyncio.Queue()
         self._pump: asyncio.Task | None = None
+        # When the audio handed over so far will have finished coming out of
+        # the speakers. The model sends a reply far faster than it is spoken,
+        # so "is the queue empty" is not the question — the question is whether
+        # sound is still in the room.
+        self._plays_until = 0.0
+
+    def is_playing(self, tail: float = 0.0) -> bool:
+        return time.monotonic() < self._plays_until + tail
 
     async def _ensure(self) -> asyncio.subprocess.Process:
         if self._proc is None or self._proc.returncode is not None:
@@ -284,6 +299,10 @@ class Speaker:
         """Hand a chunk to the player. Never waits on playback."""
         if self._pump is None or self._pump.done():
             self._pump = asyncio.create_task(self._pump_loop())
+        # PCM16 mono: two bytes a sample. Book the time this will occupy on the
+        # way out, so the microphone gate knows when the room goes quiet again.
+        seconds = len(pcm) / 2 / self.rate
+        self._plays_until = max(self._plays_until, time.monotonic()) + seconds
         self._queue.put_nowait(pcm)
 
     async def _pump_loop(self) -> None:
@@ -304,6 +323,7 @@ class Speaker:
 
     def _drop_queued(self) -> None:
         """Throw away audio not yet played. Barge-in must not be finished later."""
+        self._plays_until = 0.0
         while True:
             try:
                 self._queue.get_nowait()
@@ -364,6 +384,9 @@ class RealtimeSession:
         self._audio_item_id: str | None = None
         self._audio_response_id: str | None = None
         self._audio_bytes = 0
+        # Microphone frames dropped because she was speaking. Counted so the
+        # log says how much was held rather than going quiet about it.
+        self._held_frames = 0
         # Set between response.created and response.done. Barge-in used to fire
         # response.cancel unconditionally, so every interruption that arrived
         # between turns logged "no active response found".
@@ -1243,6 +1266,57 @@ def default_source() -> str:
     except (OSError, subprocess.SubprocessError):
         return ""
     return "" if out in ("", "@DEFAULT_SOURCE@") else out
+
+
+def _pactl(*args: str) -> str:
+    import subprocess
+    try:
+        return subprocess.run(["pactl", *args], capture_output=True,
+                              text=True, timeout=5).stdout.strip()
+    except (OSError, subprocess.SubprocessError):
+        return ""
+
+
+def default_sink() -> str:
+    out = _pactl("get-default-sink")
+    return "" if out in ("", "@DEFAULT_SINK@") else out
+
+
+def echo_risk(config: Config) -> str:
+    """Why her own voice might come back in as yours, or '' if it will not.
+
+    The failure this detects is not theoretical. On a machine whose microphone
+    and line out were the same audio interface, with both at 100% and no echo
+    cancellation, a session log has her saying "OH-mah, OH-mah, OH-mah",
+    hearing it back as "어마", and replying "Yes, I'm here." Later her own
+    sentence returned as two user turns. A fragment that transcribed as an
+    instruction — "Бела." — pressed CTRL+R.
+    """
+    if not config.barge_in:
+        return ""  # the microphone is already held shut while she speaks
+    source = (config.device or default_source()).lower()
+    sink = default_sink().lower()
+    if not source or not sink:
+        return ""
+    if "echo-cancel" in source or "echo_cancel" in source:
+        return ""
+    if any(word in source for word in ("headset", "headphone")):
+        return ""
+
+    def device_of(name: str) -> str:
+        # alsa_output.usb-Focusrite_Scarlett_Solo_...-00.HiFi__Line__sink
+        # alsa_input .usb-Focusrite_Scarlett_Solo_...-00.HiFi__Mic1__source
+        body = name.split(".", 1)[-1]
+        return body.split(".hifi")[0].split("__")[0]
+
+    if device_of(source) == device_of(sink):
+        return ("barge_in is on and your microphone and speakers are the same device "
+                f"({device_of(sink)}). Her voice will come back in as yours: the "
+                "server's turn detection hears it, cancels her reply, and transcribes "
+                "it as a command. Set barge_in = false, wear headphones, or load "
+                "PipeWire's echo-cancel module.")
+    return ("barge_in is on with speakers rather than headphones. If she starts "
+            "answering herself, set barge_in = false.")
 
 
 def check_ready(config: Config) -> list[str]:

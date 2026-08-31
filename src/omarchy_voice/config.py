@@ -144,6 +144,19 @@ class Config:
     # toggle turns it on — see RETIRED_KEYS. An always-on microphone is not a
     # setting worth having on a machine that streams room audio to an API.
     device: str = ""  # PipeWire target; empty means the default source
+    # Whether the microphone stays live while she is speaking.
+    #
+    # Off by default, and the default matters: with speakers, her voice leaves
+    # the room and comes back into an open mic. The server's turn detection
+    # hears it, cancels the reply mid-word, and transcribes it as the user —
+    # a session log has her saying "OH-mah, OH-mah, OH-mah", hearing it back as
+    # "어마", and answering herself. Worse, a stray fragment that transcribes as
+    # an instruction gets *run*: one arrived as "Бела." and pressed CTRL+R.
+    #
+    # Turn it on if you wear headphones, or if you have set up PipeWire's
+    # echo-cancel module — then you get to interrupt her mid-sentence, which is
+    # the thing this costs.
+    barge_in: bool = False
 
     # --- realtime ----------------------------------------------------------
     # These live under [realtime] in the config file; the loader prefixes that

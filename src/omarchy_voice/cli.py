@@ -6,6 +6,7 @@ import argparse
 import json
 import os
 import shutil
+import textwrap
 import subprocess
 import sys
 from pathlib import Path
@@ -133,8 +134,19 @@ def cmd_doctor(args, config) -> int:
     print("  ! while listening is on, room audio streams continuously to OpenAI.")
     print("    It starts off, and only SUPER + SHIFT + V turns it on. Toggling")
     print("    off kills the recorder, so nothing is captured while muted.")
-    source = realtime_mod.default_source()
+    source = config.device or realtime_mod.default_source()
     print(f"  default input: {source or '(none)'}")
+    print(f"  output:        {realtime_mod.default_sink() or '(none)'}")
+    if config.barge_in:
+        risk = realtime_mod.echo_risk(config)
+        print(f"  {_tick(not risk)} barge_in is on — you can interrupt her mid-sentence")
+        if risk:
+            for line in textwrap.wrap(risk, 72):
+                print(f"    {line}")
+    else:
+        print("  → the microphone is held shut while she speaks, so her own voice")
+        print("    cannot come back in as yours. Set barge_in = true (headphones,")
+        print("    or PipeWire echo-cancel) to interrupt her mid-sentence.")
 
     print(_bold("\nhands"))
     for tool in ("hyprctl", "omarchy", "wtype", "notify-send", "uwsm-app"):

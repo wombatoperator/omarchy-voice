@@ -682,3 +682,106 @@ class AnnounceTests(unittest.IsolatedAsyncioTestCase):
         await self.session._announce(self.job())
         self.assertEqual(self.socket.events("response.create"), [])
 
+
+class EchoGateTests(unittest.TestCase):
+    """Her voice must not come back in as the user's.
+
+    From a real session on speakers, with the mic and the line out on the same
+    audio interface:
+
+        reply  'OH-mah, OH-mah, OH-mah.'
+        error  response cancelled: turn_detected
+        heard  '\uc5b4\ub9c8'                <- her own name, back through the mic
+        reply  'Yes, I'm here.'
+
+    and, later, her own sentence returned as two user turns which she then
+    apologised for not catching. A fragment that transcribes as an instruction
+    is not merely noise: one arrived as 'Бела.' and pressed CTRL+R.
+    """
+
+    def setUp(self):
+        self.speaker = realtime.Speaker(rate=24000)
+
+    def test_a_fresh_speaker_is_not_playing(self):
+        self.assertFalse(self.speaker.is_playing())
+
+    def test_writing_audio_books_its_real_duration(self):
+        """PCM16 mono: one second of 24 kHz is 48000 bytes."""
+        with mock.patch.object(realtime.asyncio, "create_task"):
+            asyncio.run(self.speaker.write(b"\0" * 48000))
+        self.assertTrue(self.speaker.is_playing())
+        self.assertAlmostEqual(self.speaker._plays_until - time.monotonic(), 1.0, delta=0.2)
+
+    def test_chunks_queue_up_rather_than_overwriting_each_other(self):
+        """The model sends a reply far faster than it is spoken, so the gate
+        has to track the whole backlog, not the newest chunk."""
+        with mock.patch.object(realtime.asyncio, "create_task"):
+            for _ in range(3):
+                asyncio.run(self.speaker.write(b"\0" * 24000))   # 0.5s each
+        self.assertAlmostEqual(self.speaker._plays_until - time.monotonic(), 1.5, delta=0.3)
+
+    def test_the_tail_keeps_the_gate_shut_a_little_longer(self):
+        """A room rings after playback stops; the last syllable comes back late."""
+        self.speaker._plays_until = time.monotonic() - 0.1
+        self.assertFalse(self.speaker.is_playing())
+        self.assertTrue(self.speaker.is_playing(realtime.ECHO_TAIL_SECONDS))
+
+    def test_a_barge_in_reopens_the_microphone_at_once(self):
+        """Dropping queued audio means nothing more is coming out, so the gate
+        must not stay shut for audio that will never be played."""
+        with mock.patch.object(realtime.asyncio, "create_task"):
+            asyncio.run(self.speaker.write(b"\0" * 480000))       # 10 seconds
+        self.assertTrue(self.speaker.is_playing())
+        self.speaker._drop_queued()
+        self.assertFalse(self.speaker.is_playing())
+
+    def test_half_duplex_is_the_default(self):
+        self.assertFalse(Config().barge_in)
+
+    def test_barge_in_can_be_turned_back_on_for_headphones(self):
+        self.assertTrue(Config(barge_in=True).barge_in)
+
+
+class EchoRiskTests(unittest.TestCase):
+    """doctor should say this out loud, because working it out from a session
+    log took an evening."""
+
+    SCARLETT_MIC = ("alsa_input.usb-Focusrite_Scarlett_Solo_USB_Y73FW"
+                    "440536E29-00.HiFi__Mic1__source")
+    SCARLETT_OUT = ("alsa_output.usb-Focusrite_Scarlett_Solo_USB_Y73FW"
+                    "440536E29-00.HiFi__Line__sink")
+
+    def risk(self, config, sink):
+        with mock.patch.object(realtime, "default_sink", return_value=sink):
+            return realtime.echo_risk(config)
+
+    def test_half_duplex_needs_no_warning(self):
+        """Nothing to warn about: the microphone is shut while she speaks."""
+        self.assertEqual(
+            self.risk(Config(device=self.SCARLETT_MIC), self.SCARLETT_OUT), "")
+
+    def test_one_device_for_both_is_called_out(self):
+        risk = self.risk(Config(barge_in=True, device=self.SCARLETT_MIC),
+                         self.SCARLETT_OUT)
+        self.assertIn("same device", risk)
+        self.assertIn("barge_in = false", risk)
+
+    def test_a_headset_is_fine(self):
+        risk = self.risk(
+            Config(barge_in=True, device="alsa_input.usb-Some_Headset-00.mono-chat"),
+            "alsa_output.usb-Some_Headset-00.analog-chat")
+        self.assertEqual(risk, "")
+
+    def test_an_echo_cancelled_source_is_fine(self):
+        risk = self.risk(Config(barge_in=True, device="echo-cancel-source"),
+                         self.SCARLETT_OUT)
+        self.assertEqual(risk, "")
+
+    def test_separate_devices_still_get_a_gentle_note(self):
+        risk = self.risk(Config(barge_in=True, device=self.SCARLETT_MIC),
+                         "alsa_output.pci-0000_01_00.1.hdmi-stereo")
+        self.assertIn("answering herself", risk)
+
+    def test_nothing_is_claimed_when_the_devices_cannot_be_read(self):
+        self.assertEqual(self.risk(Config(barge_in=True, device=""), ""), "")
+

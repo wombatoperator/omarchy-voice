@@ -18,6 +18,13 @@ max_turns = 12
 # picked up while it is off.
 # device = "alsa_input.pci-0000_00_1f.3.analog-stereo"   # pin a specific mic
 
+# The microphone is held shut while Oma speaks. On speakers her voice would
+# otherwise leave the room and come back into an open mic: the server's turn
+# detection hears it, cancels her reply mid-word, and transcribes it as you.
+# Turn this on for headphones, or after setting up PipeWire echo cancellation
+# (see share/echo-cancel.conf) — then you can interrupt her mid-sentence.
+barge_in = false
+
 [realtime]
 model = "gpt-realtime-2.1"
 voice = "marin"           # cannot be changed once a session has spoken

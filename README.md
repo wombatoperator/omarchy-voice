@@ -286,6 +286,41 @@ round and eight seconds. `run_shell` is no longer
 sent at all unless `allow_shell = true`, since a tool that will only ever be
 refused costs its schema every turn and a whole round trip when reached for.
 
+## Speakers, and her hearing herself
+
+If Oma's voice comes out of speakers rather than headphones, it goes into the
+room and back into an open microphone. The server's turn detection treats that
+as you talking: it cancels the reply she is halfway through and transcribes her
+own words as a command. From a real session log, on a machine whose mic and
+line out were the same interface —
+
+```
+reply  'OH-mah, OH-mah, OH-mah.'
+error  response cancelled: turn_detected
+heard  '어마'                    ← her own name, back through the microphone
+reply  'Yes, I'm here.'
+```
+
+— and later her own sentence returned as two user turns, which she apologised
+for not catching. A fragment that transcribes as an instruction is not merely
+noise: one arrived as `'Бела.'` and pressed CTRL+R.
+
+**So the microphone is held shut while she is speaking**, plus 350 ms for the
+room to go quiet. That is the default and it needs no configuration. The only
+thing it costs is interrupting her mid-sentence — which on speakers did not
+work anyway, because she was the one doing the interrupting.
+
+To get that back, use headphones or PipeWire's echo canceller
+(`share/echo-cancel.conf`), then:
+
+```toml
+[ears]
+barge_in = true
+```
+
+`omarchy-voice doctor` reports your input and output devices and warns if you
+have turned barge-in on with both ends on the same box.
+
 ## Safety
 
 An open microphone is an untrusted input channel. The model's decisions are

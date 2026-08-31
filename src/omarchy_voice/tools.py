@@ -2328,7 +2328,15 @@ class Executor:
         if not (command or "").strip():
             return "command is required"
         if "\n" in command:
-            return "one command at a time; newlines are not sent"
+            # Naming the way that works matters more than the refusal. Given
+            # only "newlines are not sent", the model retried the same heredoc
+            # five times and then took thirteen commands and forty-five seconds
+            # to write a two-line file.
+            return ("newlines are not sent, so heredocs (cat > f <<EOF) cannot work "
+                    "here. To write a file, use printf with escapes in ONE line: "
+                    "printf '#!/bin/sh\\necho hi\\n' > f  — and note \\n inside single "
+                    "quotes is the two characters backslash-n, which printf turns into "
+                    "a newline. Append more with >>.")
         return None
 
     def _tool_run_in_terminal(self, command: str, target: str = "") -> Result:
