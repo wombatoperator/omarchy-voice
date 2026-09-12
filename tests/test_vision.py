@@ -1,6 +1,8 @@
 """Free vision tests: provider wire contracts, fresh frames, cancellation and IPC."""
 import asyncio
 import base64
+import contextlib
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import io
 import json
 import os
@@ -9,6 +11,7 @@ import subprocess
 from pathlib import Path
 import sys
 import tempfile
+import threading
 import time
 import unittest
 from unittest import mock
@@ -20,6 +23,8 @@ from omarchy_voice.tools import Executor, tools_for
 
 def wire(events):
     return io.BytesIO(b"".join(b"data: " + json.dumps(e).encode() + b"\n\n" for e in events))
+
+DETAIL = {"region": [250, 250, 500, 500], "rotation": 90, "enhancement": "contrast_sharpen"}
 
 
 class ConfigurationTests(unittest.TestCase):
@@ -38,6 +43,7 @@ class ConfigurationTests(unittest.TestCase):
 
     def test_invalid_config_and_crop_fail_before_launch(self):
         for kwargs in ({"vision_timeout_seconds": float("nan")}, {"vision_max_requests": 0},
+                       {"vision_auto_inspect": "yes"},
                        {"vision_base_url": "http://external.example/v1"},
                        {"vision_base_url": "https://" + "user:pass@" + "example.com/v1"},
                        {"vision_crop_percent": 100}, {"vision_crop_percent": True},
@@ -79,6 +85,54 @@ class ConfigurationTests(unittest.TestCase):
 
 
 class ProviderTests(unittest.TestCase):
+    def test_tool_is_optional_and_final_request_contains_both_views_without_tools(self):
+        for protocol in ("responses", "chat_completions"):
+            with self.subTest(protocol=protocol):
+                s = vision.settings(config.Config(vision_protocol=protocol))
+                _, initial = vision_provider.payload(s, "overview", "Identify this", allow_inspection=True)
+                self.assertEqual(len(initial["tools"]), 1)
+                self.assertEqual(initial["tool_choice"], "auto")
+                self.assertFalse(initial["parallel_tool_calls"])
+                _, final = vision_provider.payload(s, "overview", "Identify this", detail_image="detail", inspection=DETAIL)
+                self.assertNotIn("tools", final)
+                content = final["input" if protocol == "responses" else "messages"][0]["content"]
+                self.assertEqual(len(content), 3)
+                self.assertIn("overview", json.dumps(content[1]))
+                self.assertIn("detail", json.dumps(content[2]))
+
+    def test_only_one_complete_valid_inspection_can_execute(self):
+        call = {"type": "function_call", "name": "inspect_region", "arguments": json.dumps(DETAIL)}
+        cases = [[call], [call, call], [{**call, "name": "shell"}],
+                 [{**call, "arguments": '{"region":'}], [{**call, "status": "in_progress"}],
+                 [{**call, "arguments": json.dumps({**DETAIL, "command": "anything"})}],
+                 [{**call, "arguments": json.dumps({**DETAIL, "rotation": True})}],
+                 [{**call, "arguments": json.dumps({**DETAIL, "region": [900, 0, 500, 500]})}],
+                 [{**call, "arguments": json.dumps({**DETAIL, "enhancement": "arbitrary filter"})}]]
+        for calls in cases:
+            events = [{"type": "response.completed", "response": {"status": "completed", "output": calls}}]
+            with self.subTest(calls=calls):
+                if calls == [call]:
+                    result = vision_provider.consume(wire(events), "responses", time.monotonic(), allow_inspection=True)
+                    self.assertEqual(result["inspection"], DETAIL)
+                else:
+                    with self.assertRaises(RuntimeError):
+                        vision_provider.consume(wire(events), "responses", time.monotonic(), allow_inspection=True)
+                with self.assertRaises(RuntimeError):
+                    vision_provider.consume(wire(events), "responses", time.monotonic())
+
+    def test_chat_tool_arguments_are_assembled_but_never_used_if_truncated(self):
+        arguments = json.dumps(DETAIL)
+        events = [{"choices": [{"delta": {"tool_calls": [{"index": 0, "type": "function", "function": {
+            "name": "inspect_region", "arguments": arguments[:20]}}]}}]},
+            {"choices": [{"delta": {"tool_calls": [{"index": 0, "function": {"arguments": arguments[20:]}}]},
+                          "finish_reason": "tool_calls"}]}]
+        result = vision_provider.consume(wire(events), "chat_completions", time.monotonic(), allow_inspection=True)
+        self.assertEqual(result["inspection"], DETAIL)
+        for ending in ("length", "stop", None):
+            events[-1]["choices"][0]["finish_reason"] = ending
+            with self.subTest(ending=ending), self.assertRaises(RuntimeError):
+                vision_provider.consume(wire(events), "chat_completions", time.monotonic(), allow_inspection=True)
+
     def test_responses_and_local_chat_payloads(self):
         s = vision.settings(config.Config())
         image = base64.b64encode(b"JPEG fixture").decode()
@@ -121,6 +175,189 @@ class ProviderTests(unittest.TestCase):
 
 
 class LifecycleTests(unittest.IsolatedAsyncioTestCase):
+    @contextlib.contextmanager
+    def inspection_fixture(self, app, replies):
+        replies, messages = iter(replies), []
+        async def communicate(data):
+            messages.append(json.loads(data))
+            return json.dumps(next(replies)).encode(), None
+        process = mock.Mock(returncode=0, communicate=mock.AsyncMock(side_effect=communicate))
+        with mock.patch.object(app, "start"), \
+             mock.patch.object(app.camera, "fresh", return_value=(b"original", 123.0, 7)) as fresh, \
+             mock.patch.object(app, "image", side_effect=[b"overview", b"detail"]) as image, \
+             mock.patch.object(app, "detail_preview", return_value=b"preview"), \
+             mock.patch.object(vision_app.Camera, "active", new_callable=mock.PropertyMock, return_value=True), \
+             mock.patch.object(vision_app.asyncio, "create_subprocess_exec", return_value=process):
+            yield messages, fresh, image
+
+    async def test_automatic_detail_uses_same_source_and_counts_both_requests(self):
+        app = vision_app.Companion(vision.settings(config.Config()), mock.Mock())
+        usage = {"input_tokens": 11, "output_tokens": 7}
+        replies = [{"ok": True, "inspection": DETAIL, "usage": usage, "model_ms": 12},
+                   {"ok": True, "observation": "Identified from the label", "usage": usage,
+                    "model_ms": 15, "first_text_ms": 2}]
+        with self.inspection_fixture(app, replies) as (messages, fresh, image):
+            result = await app.inspect("Which component?", [0, 0, 500, 1000], "voice", 0)
+            fresh.assert_awaited_once()
+            image.assert_has_awaits([mock.call(b"original", [0, 0, 500, 1000]),
+                                    mock.call(b"original", [0, 0, 500, 1000], inspection=DETAIL)])
+        self.assertEqual(len(messages), 2)
+        self.assertTrue(messages[0]["allow_inspection"])
+        self.assertFalse(messages[1]["allow_inspection"])
+        self.assertEqual(messages[0]["image"], messages[1]["image"])
+        self.assertEqual(base64.b64decode(messages[1]["detail_image"]), b"detail")
+        self.assertEqual(result["captured_at"], 123.0)
+        self.assertEqual(result["frame_sequence"], 7)
+        self.assertEqual(result["model_calls"], 2)
+        self.assertEqual(app.requests, 2)
+        self.assertEqual(result["usage"], {"input_tokens": 22, "output_tokens": 14})
+        self.assertEqual(result["model_ms"], 27)
+        self.assertIsNone(app.camera.inspection_frame)
+        self.assertFalse(app.busy)
+        self.assertNotIn("Identified from the label", str(app.report.call_args_list))
+
+    async def test_direct_answer_and_disabled_or_exhausted_detail_budget_use_one_call(self):
+        for enabled, remaining, allow in ((True, 20, True), (False, 20, False), (True, 1, False)):
+            app = vision_app.Companion(vision.settings(config.Config(vision_auto_inspect=enabled)))
+            app.requests = 20 - remaining
+            with self.subTest(enabled=enabled, remaining=remaining), \
+                 self.inspection_fixture(app, [{"ok": True, "observation": "Direct answer"}]) as (messages, _, image):
+                result = await app.inspect("What is this?", None, "voice", 0)
+                self.assertEqual(len(messages), 1)
+                self.assertEqual(messages[0]["allow_inspection"], allow)
+                self.assertEqual(image.await_count, 1)
+                self.assertEqual(result["model_calls"], 1)
+                self.assertIsNone(result["inspection"])
+
+    async def test_unavailable_or_repeated_tool_call_does_not_execute(self):
+        for enabled, replies, expected in ((False, [{"ok": True, "inspection": DETAIL}], 1),
+                (True, [{"ok": True, "inspection": DETAIL}] * 2, 2)):
+            app = vision_app.Companion(vision.settings(config.Config(vision_auto_inspect=enabled)))
+            with self.subTest(enabled=enabled), self.inspection_fixture(app, replies) as (messages, _, image):
+                with self.assertRaisesRegex(RuntimeError, "step limit"):
+                    await app.inspect("Identify", None, "voice", 0)
+                self.assertEqual(len(messages), expected)
+                self.assertEqual(image.await_count, expected)
+            self.assertFalse(app.busy)
+            self.assertIsNone(app.camera.inspection_frame)
+
+    async def test_stop_after_crop_prevents_second_upload_and_snapshot_display(self):
+        app = vision_app.Companion(vision.settings(config.Config()))
+        async def crop(raw, region, **options):
+            if options:
+                app.epoch += 1
+            return b"image"
+        with self.inspection_fixture(app, [{"ok": True, "inspection": DETAIL}]) as (messages, _, image):
+            image.side_effect = crop
+            with self.assertRaisesRegex(RuntimeError, "cancelled"):
+                await app.inspect("Identify", None, "voice", 0)
+        self.assertEqual(len(messages), 1)
+        self.assertEqual(app.previous, "")
+        self.assertIsNone(app.camera.inspection_frame)
+
+    async def test_detail_failure_is_not_retried_and_restores_preview(self):
+        app = vision_app.Companion(vision.settings(config.Config()))
+        with self.inspection_fixture(app, [{"ok": True, "inspection": DETAIL},
+                {"ok": False, "error": "Provider unavailable"}]) as (messages, _, image):
+            with self.assertRaisesRegex(RuntimeError, "Provider unavailable"):
+                await app.inspect("Identify", None, "voice", 0)
+        self.assertEqual(len(messages), 2)
+        self.assertIsNone(app.camera.inspection_frame)
+        self.assertFalse(app.busy)
+
+    async def test_both_model_steps_share_one_timeout(self):
+        app = vision_app.Companion(vision.settings(config.Config()))
+        app.settings["timeout_seconds"] = .2
+        model = app.model
+        async def delayed(*args, **kwargs):
+            await asyncio.sleep(.12)
+            return await model(*args, **kwargs)
+        with self.inspection_fixture(app, [{"ok": True, "inspection": DETAIL}]) as (messages, _, _), \
+             mock.patch.object(app, "model", side_effect=delayed):
+            with self.assertRaisesRegex(RuntimeError, "timed out"):
+                await app.inspect("Identify", None, "voice", 0)
+        self.assertEqual(len(messages), 1)
+        self.assertIsNone(app.camera.inspection_frame)
+        self.assertFalse(app.busy)
+
+    async def test_real_provider_process_roundtrip_against_local_synthetic_server(self):
+        messages = []
+        class Handler(BaseHTTPRequestHandler):
+            def log_message(self, *args):
+                pass
+            def do_POST(self):
+                messages.append(json.loads(self.rfile.read(int(self.headers['Content-Length']))))
+                result = ({"status": "completed", "output": [{"type": "function_call", "name": "inspect_region",
+                    "arguments": json.dumps(DETAIL)}]} if len(messages) == 1 else
+                    {"status": "completed", "output": []})
+                events = ([] if len(messages) == 1 else [{"type": "response.output_text.delta", "delta": "Fixture answer"}])
+                events.append({"type": "response.completed", "response": result})
+                data = wire(events).getvalue()
+                self.send_response(200)
+                self.send_header('Content-Type', 'text/event-stream')
+                self.send_header('Content-Length', str(len(data)))
+                self.end_headers()
+                self.wfile.write(data)
+        server = ThreadingHTTPServer(('127.0.0.1', 0), Handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        app = vision_app.Companion(vision.settings(config.Config(
+            vision_base_url=f'http://127.0.0.1:{server.server_port}/v1')))
+        try:
+            with mock.patch.object(app, 'start'), \
+                 mock.patch.object(app.camera, 'fresh', return_value=(b'original', 123.0, 7)), \
+                 mock.patch.object(app, 'image', side_effect=[b'overview', b'detail']), \
+                 mock.patch.object(app, 'detail_preview', side_effect=RuntimeError('No drawtext filter')), \
+                 mock.patch.object(vision_app.Camera, 'active', new_callable=mock.PropertyMock, return_value=True), \
+                 mock.patch.dict(os.environ, {'PYTHONPATH': str(Path(__file__).resolve().parents[1] / 'src')}):
+                result = await app.inspect('Identify the fixture', None, 'test', 0)
+            self.assertEqual(result['observation'], 'Fixture answer')
+            self.assertEqual(result['model_calls'], 2)
+            self.assertEqual(len(messages), 2)
+            self.assertIn('tools', messages[0])
+            self.assertNotIn('tools', messages[1])
+            self.assertEqual(len(messages[1]['input'][0]['content']), 3)
+            self.assertIsNone(app.camera.inspection_frame)
+        finally:
+            await asyncio.to_thread(server.shutdown)
+            server.server_close()
+            thread.join(timeout=2)
+
+    @unittest.skipUnless(shutil.which('ffmpeg'), 'FFmpeg is optional in unit-test environments')
+    async def test_detail_crop_rotation_and_preview_preserve_selected_pixels(self):
+        pixels = b''.join(b'\xff\x00\x00' if x < 160 else
+                          b'\x00\xff\x00' if y < 120 else b'\x00\x00\xff'
+                          for y in range(240) for x in range(320))
+        def ffmpeg(data, *args):
+            return subprocess.run(['ffmpeg', '-hide_banner', '-loglevel', 'error', '-filter_threads', '1',
+                '-i', 'pipe:0', *args, '-threads', '1', 'pipe:1'], input=data, capture_output=True,
+                check=True, timeout=5).stdout
+        raw = await asyncio.to_thread(ffmpeg, b'P6\n320 240\n255\n' + pixels,
+                                      '-frames:v', '1', '-c:v', 'mjpeg', '-f', 'image2pipe')
+        app = vision_app.Companion(vision.settings(config.Config(vision_width=320, vision_height=240)))
+        selection = {"region": [500, 0, 500, 1000], "rotation": 90, "enhancement": "contrast_sharpen"}
+        detail = await app.image(raw, None, inspection=selection)
+        rgb = await asyncio.to_thread(ffmpeg, detail, '-frames:v', '1', '-pix_fmt', 'rgb24', '-f', 'rawvideo')
+        self.assertEqual(len(rgb), 168 * 112 * 3)
+        left, right = (56 * 168 + 25) * 3, (56 * 168 + 140) * 3
+        self.assertGreater(rgb[left + 2], 200)  # Bottom blue becomes left after clockwise rotation.
+        self.assertGreater(rgb[right + 1], 200)
+        self.assertLess(rgb[left], 30)  # Original left/red half must be excluded.
+        # Smaller overview uploads must not force detail crops to use its lost pixels.
+        app.settings["image_width"] = 160
+        detail = await app.image(raw, None, inspection=selection)
+        rgb = await asyncio.to_thread(ffmpeg, detail, '-frames:v', '1', '-pix_fmt', 'rgb24', '-f', 'rawvideo')
+        self.assertEqual(len(rgb), 160 * 106 * 3)
+        filters = subprocess.run(['ffmpeg', '-hide_banner', '-filters'], capture_output=True, text=True, check=True).stdout
+        if 'drawtext' not in filters:
+            return  # Optional preview label; geometry/rotation checks above still run.
+        preview = await app.detail_preview(detail)
+        shown = await asyncio.to_thread(ffmpeg, preview, '-vf', ','.join(vision.image_filters(app.settings, preview=True)),
+                                        '-frames:v', '1', '-pix_fmt', 'rgb24', '-f', 'rawvideo')
+        self.assertEqual(len(shown), 448 * 336 * 3)
+        self.assertGreater(shown[(168 * 448 + 70) * 3 + 2], 180)
+        self.assertGreater(shown[(168 * 448 + 370) * 3 + 1], 180)
+
     @unittest.skipUnless(shutil.which('ffmpeg'), 'FFmpeg is optional in unit-test environments')
     async def test_default_crop_removes_edges_and_region_uses_zoomed_coordinates(self):
         # Synthetic red border, blue middle: the requested crop must remove the

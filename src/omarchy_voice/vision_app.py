@@ -19,7 +19,7 @@ import struct
 import sys
 import time
 
-from .vision import fingerprint, image_filters, secure_runtime, validate_request, validate_settings
+from .vision import fingerprint, image_filters, secure_runtime, validate_inspection, validate_request, validate_settings
 from . import config
 from .trace import Trace
 
@@ -73,6 +73,7 @@ class Camera:
         self.stderr = {"capture": "", "preview": ""}
         self.capture = self.preview = None
         self.frame = None
+        self.inspection_frame = None
         self.frame_at = self.frame_wall = 0.0
         self.sequence = 0
         self.ready = asyncio.Event()
@@ -175,8 +176,9 @@ class Camera:
     async def _preview(self):
         try:
             while True:
-                if self.frame:
-                    self.preview.stdin.write(self.frame)
+                frame = self.inspection_frame or self.frame
+                if frame:
+                    self.preview.stdin.write(frame)
                     await asyncio.wait_for(self.preview.stdin.drain(), 1)
                 await asyncio.sleep(1 / self.settings["preview_fps"])
         except (OSError, RuntimeError, asyncio.TimeoutError) as exc:
@@ -203,6 +205,7 @@ class Camera:
         await asyncio.gather(terminate(self.capture), terminate(self.preview))
         self.capture = self.preview = None
         self.frame = None
+        self.inspection_frame = None
         self.ready.clear()
         self.failure = ""
 
@@ -264,17 +267,21 @@ class Companion:
             self.last_activity = time.monotonic()
         return self.status()
 
-    async def image(self, raw, region):
-        s = self.settings
-        filters = image_filters(s, region)
+    async def image(self, raw, region, *, inspection=None):
+        return await self.transform_image(raw, image_filters(self.settings, region, inspection=inspection))
+
+    async def transform_image(self, raw, filters):
         if not filters:
             return raw
+        epoch = self.epoch
         self.transform = await asyncio.create_subprocess_exec("ffmpeg", "-hide_banner", "-loglevel", "error",
             "-filter_threads", "1",
             "-f", "mjpeg", "-i", "pipe:0", "-vf", ",".join(filters), "-frames:v", "1", "-threads", "1",
             "-c:v", "mjpeg", "-q:v", "3", "-f", "image2pipe", "pipe:1",
             stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL)
         try:
+            if epoch != self.epoch:
+                raise RuntimeError("Camera stopped during image processing")
             output, _ = await asyncio.wait_for(self.transform.communicate(raw), 5)
             if self.transform.returncode or not output.startswith(b"\xff\xd8"):
                 raise RuntimeError("Camera crop/resize failed")
@@ -282,6 +289,47 @@ class Companion:
         finally:
             await terminate(self.transform)
             self.transform = None
+
+    async def detail_preview(self, image):
+        # Pad around the detail so FFplay's existing framing shows the whole
+        # snapshot in the SAME window. Live preview needs no extra encoder.
+        s = self.settings
+        scale = min(640 / s["width"], 640 / s["height"])
+        width, height = (max(2, int(s[key] * scale) // 2 * 2) for key in ("width", "height"))
+        keep = (100 - s["crop_percent"]) / 100
+        view_w, view_h = int(width * keep) // 2 * 2, int(height * keep) // 2 * 2
+        return await self.transform_image(image, [
+            f"scale={view_w}:{view_h}:force_original_aspect_ratio=decrease:force_divisible_by=2",
+            f"pad={view_w}:{view_h}:(ow-iw)/2:(oh-ih)/2",
+            "drawbox=x=0:y=0:w=iw:h=ih:color=cyan:t=3",
+            "drawtext=text='DETAIL SNAPSHOT':fontsize=14:fontcolor=white:box=1:boxcolor=black@0.8:x=6:y=6",
+            f"pad={width}:{height}:(ow-iw)/2:(oh-ih)/2"])
+
+    def check_inspection(self, epoch):
+        if epoch != self.epoch or not self.camera.active:
+            raise RuntimeError("Camera inspection was cancelled; discarded old result: " +
+                               (self.camera.failure or self.reason))
+
+    async def model(self, image, question, epoch, **options):
+        self.check_inspection(epoch)
+        if self.requests >= self.settings["max_requests"]:
+            raise RuntimeError("Camera session request limit reached")
+        self.requests += 1  # Every attempted provider call consumes the session budget.
+        try:
+            self.inference = await asyncio.create_subprocess_exec(sys.executable, "-m", "omarchy_voice.vision_provider",
+                stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL)
+            self.check_inspection(epoch)
+            message = {"settings": self.settings, "image": base64.b64encode(image).decode(), "question": question,
+                       "previous": self.previous, **options}
+            data, _ = await self.inference.communicate(json.dumps(message).encode())
+            self.check_inspection(epoch)
+            result = json.loads(data)
+            if not result.get("ok"):
+                raise RuntimeError(result.get("error", "Camera inspection failed"))
+            return result
+        finally:
+            await terminate(self.inference)
+            self.inference = None
 
     async def inspect(self, question, region, owner, owner_pid):
         if self.busy:
@@ -299,39 +347,69 @@ class Companion:
             if self.requests >= self.settings["max_requests"]:
                 raise RuntimeError("Camera session request limit reached; stop and start a new session")
             stage = "fresh_frame"
-            raw, captured_at, sequence = await self.camera.fresh()
+            source, captured_at, sequence = await self.camera.fresh()
             stage = "transform"
-            raw = await self.image(raw, region)
-            if epoch != self.epoch or not self.camera.active:
-                raise RuntimeError("Camera stopped before inspection")
-            self.requests += 1
+            raw = await self.image(source, region)
+            self.check_inspection(epoch)
             self.reason = "inspecting"
             stage = "provider"
             prepared_ms = round((time.monotonic() - began) * 1000, 1)
-            self.inference = await asyncio.create_subprocess_exec(sys.executable, "-m", "omarchy_voice.vision_provider",
-                stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL)
-            if epoch != self.epoch or not self.camera.active:
-                raise RuntimeError("Camera stopped before upload")
-            message = {"settings": self.settings, "image": base64.b64encode(raw).decode(), "question": question,
-                       "previous": self.previous}
-            data, _ = await asyncio.wait_for(self.inference.communicate(json.dumps(message).encode()),
-                                             self.settings["timeout_seconds"])
-            if epoch != self.epoch or not self.camera.active:
-                raise RuntimeError("Camera inspection was cancelled; discarded old result: " +
-                                   (self.camera.failure or self.reason))
-            result = json.loads(data)
-            if not result.get("ok"):
-                raise RuntimeError(result.get("error", "Camera inspection failed"))
+            selection, detail, requests = None, None, []
+            allow = self.settings["auto_inspect"] and self.requests + 2 <= self.settings["max_requests"]
+            async with asyncio.timeout(self.settings["timeout_seconds"]):
+                for step in range(2):
+                    stage = "provider" if step == 0 else "detail_provider"
+                    call_started_ms = (time.monotonic() - began) * 1000
+                    options = {"allow_inspection": allow and step == 0}
+                    if detail is not None:
+                        options.update(detail_image=base64.b64encode(detail).decode(), inspection=selection)
+                    result = await self.model(raw, question, epoch, **options)
+                    requests.append({key: result.get(key) for key in ("model_ms", "first_text_ms", "usage")})
+                    self.report("vision_model_finished", step=step + 1, frame_sequence=sequence, **requests[-1])
+                    if "inspection" not in result:
+                        if not isinstance(result.get("observation"), str) or not result["observation"].strip():
+                            raise RuntimeError("Vision returned no completed observation")
+                        break
+                    if not options["allow_inspection"]:
+                        raise RuntimeError("Vision inspection step limit reached; no further tools executed")
+                    selection = result["inspection"]
+                    validate_inspection(selection)
+                    self.report("vision_inspection_selected", frame_sequence=sequence, **selection)
+                    stage = "detail_transform"
+                    detail = await self.image(source, region, inspection=selection)
+                    self.check_inspection(epoch)
+                    stage = "detail_preview"
+                    try:
+                        preview = await self.detail_preview(detail)
+                    except (RuntimeError, OSError):
+                        # A missing optional drawtext filter must not turn a
+                        # valid inspection into another paid retry.
+                        self.report("vision_detail_preview_unavailable", frame_sequence=sequence)
+                    else:
+                        self.check_inspection(epoch)
+                        self.camera.inspection_frame = preview
+            self.check_inspection(epoch)
+            usage = {}
+            for field, chat_field in (("input_tokens", "prompt_tokens"), ("output_tokens", "completion_tokens")):
+                values = [(r["usage"] or {}).get(field, (r["usage"] or {}).get(chat_field)) for r in requests]
+                usage[field] = sum(values) if all(type(v) is int for v in values) else None
+            result.update(model_calls=len(requests), usage=usage, request_metrics=requests,
+                          model_ms=round(sum(r["model_ms"] or 0 for r in requests), 1),
+                          first_text_ms=round(call_started_ms + result["first_text_ms"], 1)
+                              if result.get("first_text_ms") is not None else None)
             self.previous = f'Captured at {captured_at}: {result["observation"]}'
             self.last_activity = time.monotonic()
             self.reason = "camera on"
             self.report("vision_inspect_finished", ready_ms=ready_ms, prepared_ms=prepared_ms,
                         total_ms=round((time.monotonic() - began) * 1000, 1),
                         model_ms=result.get("model_ms"), first_text_ms=result.get("first_text_ms"),
-                        usage=result.get("usage"), image_bytes=len(raw), frame_sequence=sequence)
+                        usage=result.get("usage"), model_calls=len(requests), image_bytes=len(raw),
+                        detail_image_bytes=len(detail) if detail else 0, frame_sequence=sequence)
             return {**result, "model": self.settings["model"], "captured_at": captured_at, "frame_sequence": sequence,
                     "crop_percent": self.settings["crop_percent"], "sharpen": self.settings["sharpen"],
-                    "region": region, "image_bytes": len(raw), "total_ms": round((time.monotonic() - began) * 1000, 1),
+                    "region": region, "inspection": selection, "image_bytes": len(raw),
+                    "detail_image_bytes": len(detail) if detail else 0,
+                    "total_ms": round((time.monotonic() - began) * 1000, 1),
                     "observation_age_ms": round((time.time() - captured_at) * 1000),
                     "freshness": "Snapshot at captured_at; not a claim of continuous awareness"}
         except asyncio.TimeoutError:
@@ -346,8 +424,7 @@ class Companion:
                         total_ms=round((time.monotonic() - began) * 1000, 1), **self.camera.diagnostics())
             raise
         finally:
-            await terminate(self.inference)
-            self.inference = None
+            self.camera.inspection_frame = None
             self.busy = False
             if self.camera.active:
                 self.reason = "camera on"

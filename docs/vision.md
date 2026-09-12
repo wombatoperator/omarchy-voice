@@ -9,7 +9,8 @@ app can also use open-weight models served locally through compatible APIs.
 
 Say **“OMA, look at this”** or **“What is this connector?”**. The `camera_view`
 tool opens a visible preview, takes a fresh frame, asks the configured model, and
-returns a timestamped observation to the conversation. Follow-up questions get
+returns a timestamped observation to the conversation. It can automatically
+request one detail crop before answering. Follow-up questions get
 fresh images and a bounded previous observation for continuity. Screen/browser
 questions continue to use the screen/browser tools.
 
@@ -28,7 +29,7 @@ as a new frame.
 
 ```sh
 omarchy-vision start                       # local preview, no API call
-omarchy-vision inspect "What is this?"      # one image request
+omarchy-vision inspect "What is this?"      # one snapshot; up to two model requests
 omarchy-vision status                      # local metadata only
 omarchy-vision stop
 omarchy-vision quit                        # also exit the companion
@@ -55,6 +56,37 @@ Optional `--region X Y W H` crops the image using normalized coordinates from
 of the zoomed view. The preview keeps its configured framing. Cropping changes
 the field of view; it cannot recover unreadable detail. There is no generative enhancement or
 super-resolution.
+
+## Automatic detail inspection
+
+With `auto_inspect = true` (the default), the observer can answer immediately or
+call one local `inspect_region` tool. It chooses the crop itself; no crop approval
+prompt is shown. The tool accepts only a region, clockwise rotation of 0/90/180/270
+degrees, and a preset: `none`, `contrast`, `sharpen`, or `contrast_sharpen`.
+Contrast uses a mild fixed adjustment; sharpening raises the configured amount
+to at least 0.8. Neither restores missing optical detail.
+
+The tool's coordinates refer to the first supplied image, including the configured
+30% crop and any explicit `--region`. Each selected dimension must span at least
+5% of that view. Processing starts again from the original captured JPEG, before
+upload resizing, and preserves its capture timestamp. Moving the object during
+analysis does not change the selected snapshot.
+
+The final request contains both the overview and processed detail, with no tools
+available. There are at most two model calls per camera inspection, sharing
+`timeout_seconds` for inference and detail processing. Each call counts toward
+`max_requests`; with only one call remaining, the observer answers without tools.
+Invalid tool requests and failed model calls are not retried.
+
+During the detail request, the existing camera window shows a bordered, labeled
+**DETAIL SNAPSHOT**, then returns to live video. No additional window opens.
+If FFmpeg cannot render the optional label, the live preview continues and a
+diagnostic event records that the detail preview was unavailable. Closing the
+window or stopping the camera cancels the inspection.
+
+Set `auto_inspect = false` for the original single-pass behavior or for a provider
+without streaming function-call support. Automatic detail inspection adds no
+Python dependency and uses the same configured model for both calls.
 
 ## Configuration and model switching
 
@@ -89,7 +121,8 @@ detail = ""
 ```
 
 The endpoint must implement streaming image input via Responses or Chat
-Completions. Vendor-specific APIs such as a native model-server chat endpoint
+Completions, plus function calls when `auto_inspect` is enabled. Vendor-specific
+APIs such as a native model-server chat endpoint
 need an adapter; this app does not pretend every VLM has the same API. Local
 compatibility is tested against the wire contract, not every inference server.
 No OpenAI credential is implicitly forwarded to a custom endpoint. If a custom
@@ -107,10 +140,11 @@ tool from OMA; stop an already active preview when disabling it.
 
 - The native MJPEG capture path copies compressed camera frames without encoding
   them again. Other V4L2 formats use FFmpeg's JPEG encoder.
-- Capture keeps exactly one latest JPEG. Preview uses a separate bounded pipe;
+- Capture keeps one latest JPEG plus the current inspection's bounded snapshot
+  and processed views. Preview uses a separate bounded pipe;
   a stalled preview stops the camera instead of building a backlog.
 - Each inspection waits for a frame captured after the request. Camera startup
-  is paid once per visual session. Only explicit inspections invoke a model;
+  is paid once per visual session. Only requested inspections invoke a model;
   holding the preview open does not make periodic paid calls.
 - Capture retains the source JPEG; FFplay applies the default crop and sharpening
   to the preview. Only selected inspection frames are transformed and re-encoded.
@@ -122,7 +156,11 @@ tool from OMA; stop an already active preview when disabling it.
   still charge work already submitted after a local cancellation.
 - Returned metrics include `first_text_ms`, `model_ms`, `total_ms`, image bytes,
   capture timestamp, and observation age. These do not include OMA's subsequent
-  spoken output. First text may be a heading rather than a useful identification.
+  spoken output. `model_calls` and `request_metrics` report both calls when used;
+  `model_ms` sums their model durations and `first_text_ms` measures time from
+  inspection start to the first text in the final answer. First text may still
+  be a heading rather than a useful identification. `inspection` records the
+  chosen crop/preset, and `detail_image_bytes` reports the extra image size.
 
 There is no production dollar ledger because provider prices vary. Session time,
 request count and output limits bound work; these are not account billing caps.
@@ -131,7 +169,8 @@ request count and output limits bound work; these are not account billing caps.
 
 Preview pixels and selected JPEGs stay in RAM and are not written to disk. An
 inspection sends the current question, selected frame, and up to 1,200 characters
-of the previous visual observation to the configured endpoint. Responses requests
+of the previous visual observation to the configured endpoint. An automatic
+detail request sends that overview again with the processed crop. Responses requests
 use `store: false`; provider retention policies still apply. OMA's ordinary
 conversation/tool logs may contain the resulting descriptions. Closing the camera
 clears the companion's last frame and observation. It does not delete voice logs.

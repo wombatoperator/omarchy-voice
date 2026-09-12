@@ -15,6 +15,7 @@ local tools carry out desktop actions through a policy gate.
 - Runs durable coding and analysis tasks with saved artifacts and verification.
 - Inspects physical objects through an on-demand camera preview with configurable
   cloud or local vision models, cropping, and gentle sharpening.
+  The observer can automatically choose one closer detail view per question.
 
 Example requests:
 

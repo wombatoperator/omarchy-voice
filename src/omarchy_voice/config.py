@@ -147,6 +147,7 @@ class Config:
 
     # On-demand camera companion. Enabled exposes tools; capture starts OFF.
     vision_enabled: bool = True
+    vision_auto_inspect: bool = True  # One optional model-selected detail view, without confirmation.
     vision_model: str = "gpt-6-astra"
     vision_protocol: str = "responses"  # responses | chat_completions
     vision_base_url: str = "https://api.openai.com/v1"

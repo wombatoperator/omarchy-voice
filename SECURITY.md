@@ -18,11 +18,15 @@ latest source revision.
 - Voice audio is sent to OpenAI while listening is enabled. Tool results, selected
   page text, screenshots, and task inputs can also leave the machine. Muting stops
   recording; it does not cancel previously submitted background tasks.
-- Camera preview stays local. Explicit camera inspections send one selected frame,
+- Camera preview stays local. Explicit camera inspections send a selected frame,
   the question, and bounded previous visual context to the configured vision
   endpoint. No frames are saved by the companion; descriptions can appear in
   normal voice logs. Muting stops a camera owned by that voice session. Local
   cancellation cannot retract a request already received by a model provider.
+  With automatic inspection enabled, the observer may select one crop with a
+  fixed rotation/enhancement preset, without separate confirmation. A second
+  request sends the overview and detail from that same snapshot. The image tool
+  cannot execute arbitrary commands, access files, or change provider settings.
   Automatic lock detection requires `omarchy-shell`; see [OMA Vision](docs/vision.md)
   for the full camera lifecycle and provider settings.
 - Desktop tools run with your user privileges. The regex deny/confirmation policy

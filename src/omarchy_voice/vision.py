@@ -34,6 +34,10 @@ Use camera_view(action='inspect', question=...) when the user says 'look at this
 'what am I holding', or asks about something in the physical camera view. Pass the
 actual question and relevant conversation context in one call; inspect opens the
 preview itself. For screen/browser questions use the existing screen tools.
+The observer can automatically crop, rotate and enhance one detail from that
+snapshot. Do not ask for crop approval or send another camera call to enable it.
+Use one inspect per visual question; do not repeat a failed inspection without
+a new user request.
 Use start only for opening the preview without analysis; stop to turn the camera
 off. Follow-up questions about the physical object need a fresh inspect. Never
 claim live awareness from an old observation. Observations have capture times,
@@ -66,6 +70,8 @@ def settings(config):
 def validate_settings(s):
     if type(s["enabled"]) is not bool:
         raise ValueError("vision.enabled must be a boolean")
+    if type(s["auto_inspect"]) is not bool:
+        raise ValueError("vision.auto_inspect must be a boolean")
     if s["protocol"] not in {"responses", "chat_completions"}:
         raise ValueError("vision.protocol must be responses or chat_completions")
     url = urlsplit(s["base_url"])
@@ -98,7 +104,20 @@ def validate_settings(s):
             raise ValueError(f"vision.{name} must be between {low} and {high}")
 
 
-def image_filters(s, region=None, *, preview=False):
+def validate_inspection(value):
+    """Only this bounded image operation may be selected by the observer."""
+    if not isinstance(value, dict) or set(value) != {"region", "rotation", "enhancement"}:
+        raise ValueError("Inspection requires only region, rotation and enhancement")
+    validate_request("inspect", region=value["region"])
+    if value["region"] is None or min(value["region"][2:]) < 50:
+        raise ValueError("Inspection region must span at least 5% of each image dimension")
+    if type(value["rotation"]) is not int or value["rotation"] not in (0, 90, 180, 270):
+        raise ValueError("Inspection rotation must be 0, 90, 180 or 270 degrees clockwise")
+    if value["enhancement"] not in ("none", "contrast", "sharpen", "contrast_sharpen"):
+        raise ValueError("Unknown inspection enhancement preset")
+
+
+def image_filters(s, region=None, *, preview=False, inspection=None):
     """Same framing/enhancement for preview and inference; no synthetic detail."""
     filters = []
     if s["crop_percent"]:
@@ -108,10 +127,21 @@ def image_filters(s, region=None, *, preview=False):
     if region:
         x, y, w, h = region
         filters.append(f"crop=iw*{w}/1000:ih*{h}/1000:iw*{x}/1000:ih*{y}/1000")
-    if not preview and s["image_width"] < s["width"]:
+    sharpen = s["sharpen"]
+    if inspection is not None:
+        validate_inspection(inspection)
+        x, y, w, h = inspection["region"]
+        filters.append(f"crop=iw*{w}/1000:ih*{h}/1000:iw*{x}/1000:ih*{y}/1000")
+        filters.extend({0: [], 90: ["transpose=1"], 180: ["hflip", "vflip"],
+                        270: ["transpose=2"]}[inspection["rotation"]])
+        if "contrast" in inspection["enhancement"]:
+            filters.append("eq=contrast=1.15:brightness=0.02:saturation=1")
+        if "sharpen" in inspection["enhancement"]:
+            sharpen = max(sharpen, 0.8)
+    if not preview and (inspection is not None or s["image_width"] < s["width"]):
         filters.append(f"scale=min(iw\\,{s['image_width']}):-2")
-    if s["sharpen"]:
-        filters.append(f"unsharp=5:5:{s['sharpen']:g}:5:5:0")
+    if sharpen:
+        filters.append(f"unsharp=5:5:{sharpen:g}:5:5:0")
     return filters
 
 

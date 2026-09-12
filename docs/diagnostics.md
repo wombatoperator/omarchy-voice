@@ -40,6 +40,14 @@ three-second timeout; framing errors stop capture immediately.
 `vision_frame_dropped` and `vision_frames_recovered` describe each burst without
 logging every empty record. No stale frame is submitted as a fresh observation.
 
+Automatic detail inspection emits `vision_inspection_selected` with the normalized
+crop, rotation, enhancement preset and original frame sequence. Each
+`vision_model_finished` records its step, timing and usage; `vision_inspect_finished`
+includes `model_calls` and `detail_image_bytes`. The two steps share one inference
+timeout. `vision_detail_preview_unavailable` means analysis continued with the
+live preview because the labeled snapshot could not be rendered. No images,
+questions or answer text are added to these events.
+
 ## Latency
 
 ```toml
