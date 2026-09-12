@@ -997,6 +997,15 @@ class MicrophoneGateTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(appended), 4)
         self.assertEqual(session._held_frames, 0)
 
+    async def test_held_audio_is_not_counted_as_something_to_commit(self):
+        """`turn_detection = none` commits whatever is in the buffer on
+        toggle-off. Her own voice is not a turn: if a held frame still set the
+        flag, letting go of the key would commit a buffer holding nothing but
+        her reply, and she would answer herself."""
+        session, appended, _ = await self.run_mic([self.FRAME] * 2, speaking=5.0)
+        self.assertEqual(appended, [])
+        self.assertFalse(session._appended_audio)
+
 
 class SpeechMeterTests(unittest.TestCase):
     """What the orb is told about her own voice."""
