@@ -278,15 +278,15 @@ class CommandLookupTests(unittest.TestCase):
 
     def test_the_tool_tells_the_model_what_to_do_with_a_hit(self):
         executor = Executor(Config())
-        with mock.patch("omarchy_voice.capabilities.search_commands",
-                        return_value=["  omarchy theme list"]):
+        with mock.patch("omarchy_voice.capabilities.command_index",
+                        return_value=[("omarchy theme list", "List themes")]):
             result = executor.call("omarchy_help", {"query": "theme"})
         self.assertTrue(result.ok)
         self.assertIn("omarchy_cli", result.output)
 
     def test_a_miss_suggests_a_plainer_word(self):
         executor = Executor(Config())
-        with mock.patch("omarchy_voice.capabilities.search_commands", return_value=[]):
+        with mock.patch("omarchy_voice.capabilities.command_index", return_value=[]):
             result = executor.call("omarchy_help", {"query": "xyzzy"})
         self.assertFalse(result.ok)
         self.assertIn("plainer", result.output)

@@ -117,7 +117,7 @@ RETIRED_KEYS = {
 
 # Sections whose keys are namespaced rather than flattened, because the plain
 # names are already taken by another section.
-PREFIXED_SECTIONS = {"realtime"}
+PREFIXED_SECTIONS = {"realtime", "live", "tasks", "network"}
 
 # List-valued policy keys union with the built-in lists unless the matching
 # `*_replace` flag is set. Unknown keys are kept so doctor can report typos.
@@ -138,6 +138,45 @@ class Config:
     # had to say "carry on". Each round costs a turn against the per-minute
     # token budget, which is why this is 12 and not 30.
     max_turns: int = 12
+    # Keep Realtime available while the Live transport is evaluated.
+    engine: str = "realtime"
+
+    network_enabled: bool = True
+    network_interval_seconds: float = 20.0
+    network_timeout_seconds: float = 5.0
+
+    # --- live --------------------------------------------------------------
+    live_model: str = "gpt-live-1"
+    live_voice: str = "marin"
+    live_backend_model: str = "gpt-5.6-terra"
+    live_sample_rate: int = 24000
+    live_max_output_tokens: int = 2048
+    live_reasoning_effort: str = "low"
+    # Priority processing costs more; keep it an explicit deployment choice.
+    live_service_tier: str = "default"
+    live_max_parallel_tools: int = 4
+    live_browser_enabled: bool = True
+    live_browser_max_turns: int = 8
+    live_browser_timeout_seconds: float = 90.0
+    live_browser_max_output_tokens: int = 1024
+    live_playback_buffer_ms: int = 120
+    # Personal sources used by "my news"; empty means ask rather than invent.
+    news_sources: list[str] = field(default_factory=list)
+    # A connected Live session is billed by time, including silence.
+    live_max_session_seconds: float = 1800.0
+    live_typed_idle_seconds: float = 15.0
+
+    # Durable, isolated work. These budgets are independent of voice sessions.
+    tasks_enabled: bool = True
+    tasks_provider: str = "responses"
+    tasks_model: str = "gpt-6-astra"
+    tasks_root: str = ""  # default: STATE_DIR / tasks
+    tasks_max_active: int = 1
+    tasks_timeout_seconds: int = 1800
+    tasks_max_model_calls: int = 24
+    tasks_max_output_tokens: int = 8192
+    tasks_command_timeout_seconds: int = 600
+    tasks_max_log_bytes: int = 8 * 1024 * 1024
 
     # --- ears --------------------------------------------------------------
     # There is no mode. Listening is off when the daemon starts and only the

@@ -172,6 +172,7 @@ class ExecutorTests(unittest.TestCase):
 
     def test_type_text_passes_dash_dash(self):
         executor = Executor(Config(dry_run=False))
+        executor._window_geometry = mock.Mock(return_value=({'class': 'foot', 'xwayland': False}, ''))
         with mock.patch.object(Executor, "_shell") as shell:
             from omarchy_voice.tools import Result
             shell.return_value = Result(True, "")

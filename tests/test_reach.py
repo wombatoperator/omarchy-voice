@@ -463,7 +463,9 @@ class OfferedToolsTests(unittest.TestCase):
 
     def test_everything_else_is_always_offered(self):
         offered = {s["name"] for s in tools_for(Config())}
-        self.assertEqual(offered, {s["name"] for s in TOOL_SCHEMAS} - {"run_shell"})
+        from omarchy_voice.tasks import SCHEMAS
+        self.assertEqual(offered, ({s["name"] for s in TOOL_SCHEMAS} - {"run_shell"}) |
+                         {s["name"] for s in SCHEMAS})
 
     def test_every_offered_tool_has_a_handler(self):
         executor = Executor(Config(allow_shell=True))

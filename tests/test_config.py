@@ -32,6 +32,13 @@ class ConfigLoadTests(unittest.TestCase):
         self.assertEqual(loaded.unknown_keys, [])
         self.assertIn("mode", loaded.retired_keys)
 
+    def test_parallel_limit_and_personal_news_sources_load(self):
+        path = self.write('[live]\nmax_parallel_tools = 4\n[navigation]\nnews_sources = ["https://apnews.com/"]\n')
+        loaded = cfg.load(path)
+        self.assertEqual(loaded.live_max_parallel_tools, 4)
+        self.assertEqual(loaded.news_sources, ["https://apnews.com/"])
+        self.assertEqual(loaded.unknown_keys, [])
+
     def test_a_retired_key_still_gets_explained(self):
         self.assertIn("toggle", cfg.RETIRED_KEYS["mode"])
 

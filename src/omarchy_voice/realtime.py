@@ -23,6 +23,7 @@ from __future__ import annotations
 import array
 import asyncio
 import base64
+from collections import deque
 import contextlib
 import hashlib
 import json
@@ -37,6 +38,7 @@ from typing import Any
 from . import capabilities
 from .config import Config, CONFIG_DIR, ENV_FILE, SAFETY_ID_FILE
 from .feedback import Feedback
+from .network import monitored_socket
 from .persona import PERSONA
 from .session import ControlServer, _matches
 from .tools import TOOL_SCHEMAS, Executor, tools_for
@@ -53,6 +55,10 @@ ECHO_TAIL_SECONDS = 0.35
 # 100 ms of 24 kHz mono PCM16. Small enough that turn detection feels immediate,
 # large enough that we are not sending a websocket frame every few milliseconds.
 FRAME_BYTES = 4800
+
+# How finely her own speech is measured for the meter, in seconds. The orb is
+# polled at 60 ms, so finer than this buys nothing anyone can see.
+METER_SLICE = 0.05
 
 # Server errors that mean "you were slightly late", not "something is wrong".
 # Cancelling a response that finished a moment earlier is unavoidable: the
@@ -72,6 +78,10 @@ RATE_LIMIT_PAUSE = 2.0
 RECONNECT_ATTEMPTS = 6
 RECONNECT_BASE_DELAY = 2.0
 RECONNECT_MAX_DELAY = 30.0
+# A connection that stayed up this long was working, so whatever ended it was
+# not a failed reconnect and must not spend the budget above. Comfortably under
+# the server's own 60-minute session cap, and comfortably over a flap.
+RECONNECT_HEALTHY_SECONDS = 60.0
 
 
 def frame_level(chunk: bytes) -> float:
@@ -280,9 +290,29 @@ class Speaker:
         # so "is the queue empty" is not the question — the question is whether
         # sound is still in the room.
         self._plays_until = 0.0
+        # (starts_at, ends_at, loudness) for audio booked and not yet played.
+        # The same reasoning as _plays_until, one step further: the meter wants
+        # to know how loud she is *right now*, and "right now" is nowhere near
+        # the chunk arriving off the socket.
+        self._envelope: deque[tuple[float, float, float]] = deque()
 
     def is_playing(self, tail: float = 0.0) -> bool:
         return time.monotonic() < self._plays_until + tail
+
+    def level_now(self) -> float:
+        """How loud she is at this instant, 0..1, on the same scale as the mic.
+
+        Without this the orb has nothing to show while she talks — and the
+        microphone gate makes that worse, not better, because it deliberately
+        pins the input meter to zero for the whole of every reply. A meter that
+        goes flat exactly when the assistant is speaking reads as "it stopped".
+        """
+        now = time.monotonic()
+        while self._envelope and self._envelope[0][1] <= now:
+            self._envelope.popleft()
+        if self._envelope and self._envelope[0][0] <= now:
+            return self._envelope[0][2]
+        return 0.0
 
     async def _ensure(self) -> asyncio.subprocess.Process:
         if self._proc is None or self._proc.returncode is not None:
@@ -302,7 +332,25 @@ class Speaker:
         # PCM16 mono: two bytes a sample. Book the time this will occupy on the
         # way out, so the microphone gate knows when the room goes quiet again.
         seconds = len(pcm) / 2 / self.rate
-        self._plays_until = max(self._plays_until, time.monotonic()) + seconds
+        starts_at = max(self._plays_until, time.monotonic())
+        self._plays_until = starts_at + seconds
+        # Book the loudness on the same clock, in slices. One level for a whole
+        # delta would make the meter a staircase — deltas arrive in whatever
+        # size the server feels like, and half a second of speech is not one
+        # amplitude. METER_SLICE is roughly a syllable's worth of detail.
+        # Drop what has already been played. level_now() prunes too, but only
+        # the microphone loop calls it and that runs only while listening is
+        # on — a typed `say` with the mic shut would otherwise book slices that
+        # nothing ever collects.
+        now = time.monotonic()
+        while self._envelope and self._envelope[0][1] <= now:
+            self._envelope.popleft()
+        step = int(self.rate * METER_SLICE) * 2
+        for offset in range(0, len(pcm), max(step, 2)):
+            slice_ = pcm[offset:offset + step]
+            at = starts_at + (offset / 2 / self.rate)
+            self._envelope.append(
+                (at, at + len(slice_) / 2 / self.rate, frame_level(slice_)))
         self._queue.put_nowait(pcm)
 
     async def _pump_loop(self) -> None:
@@ -324,6 +372,7 @@ class Speaker:
     def _drop_queued(self) -> None:
         """Throw away audio not yet played. Barge-in must not be finished later."""
         self._plays_until = 0.0
+        self._envelope.clear()
         while True:
             try:
                 self._queue.get_nowait()
@@ -427,13 +476,14 @@ class RealtimeSession:
 
     # -- session configuration ----------------------------------------------
     async def _instructions(self) -> str:
+        from .tasks import ROUTING
         manifest, live = await asyncio.gather(
             asyncio.to_thread(capabilities.manifest),
             asyncio.to_thread(capabilities.live_state),
         )
         self._state_refreshed = time.monotonic()
         return "\n\n".join([
-            PERSONA, REALTIME_PERSONA, manifest,
+            PERSONA, REALTIME_PERSONA, ROUTING if self.config.tasks_enabled else "", manifest,
             "# The desktop right now\n\n" + live,
         ])
 
@@ -489,6 +539,7 @@ class RealtimeSession:
         while not self._stop.is_set():
             try:
                 await asyncio.sleep(WATCH_POLL_SECONDS)
+                await self._poll_task_notices()
                 finished = await asyncio.to_thread(self.executor.poll_watches)
                 for job in finished:
                     await self._announce(job)
@@ -496,6 +547,19 @@ class RealtimeSession:
                 raise
             except Exception as exc:  # a watcher must never take the session down
                 self.feedback.log(f"warn    watcher: {type(exc).__name__}: {exc}")
+
+    async def _poll_task_notices(self):
+        if not self.config.tasks_enabled:
+            return
+        try:
+            manager = await asyncio.to_thread(self.executor.task_manager)
+            await asyncio.to_thread(manager.list)
+            for notice in await asyncio.to_thread(manager.store.notices):
+                # General workers use desktop notifications in the Realtime backend.
+                if await asyncio.to_thread(self.feedback.notify, "OMA task", notice["text"]):
+                    await asyncio.to_thread(manager.store.acknowledge, notice["id"])
+        except Exception as exc:
+            self.feedback.log(f"warn    task notices: {exc}")
 
     async def _announce(self, job: dict) -> None:
         """Interrupt with a finished job — or notify, if nobody is listening."""
@@ -647,8 +711,38 @@ class RealtimeSession:
                             self._exit_code = 1
                             self._stop.set()
                         break
+                    # Half duplex. While her own voice is still in the room the
+                    # microphone does not count, because the server's turn
+                    # detection has no way to know the voice it hears is hers.
+                    # The frame is read and dropped rather than not read: the
+                    # recorder must keep draining or it backs up behind us.
+                    #
+                    # This branch is the whole fix. Everything it needs —
+                    # Speaker's duration bookkeeping, is_playing, the tail —
+                    # was written and tested one commit ago and then never
+                    # called, so the gate existed everywhere except the audio
+                    # path: doctor said the microphone was held shut, HANDOFF
+                    # said so, and 1,991 lines of session log contained not one
+                    # `mic held` line because nothing could ever emit it.
+                    if not self.config.barge_in and self.speaker.is_playing(
+                            ECHO_TAIL_SECONDS):
+                        self._held_frames += 1
+                        # Nothing is being heard right now, so the input meter
+                        # must not twitch on her voice bleeding back in — that
+                        # reads as "it is listening to you". Her own level goes
+                        # out on the second channel instead, which is what the
+                        # orb breathes with for the length of a reply.
+                        self.feedback.level(0.0, self.speaker.level_now())
+                        continue
+                    if self._held_frames:
+                        # One line per reply, not per frame: this is how much of
+                        # her own voice was kept out, said out loud in the log
+                        # rather than dropped silently.
+                        self.feedback.log(
+                            f"mic     held {self._held_frames} frames while speaking")
+                        self._held_frames = 0
                     self._appended_audio = True
-                    self.feedback.level(frame_level(chunk))
+                    self.feedback.level(frame_level(chunk), self.speaker.level_now())
                     await self._send({
                         "type": "input_audio_buffer.append",
                         "audio": base64.b64encode(chunk).decode(),
@@ -1093,16 +1187,41 @@ class RealtimeSession:
         while not self._user_quit:
             self._dropped = False
             self._stop.clear()
+            connected_at = time.monotonic()
             try:
                 await self._open_one(url, headers)
-                if not self._dropped:
-                    attempt = 0
-                    delay = RECONNECT_BASE_DELAY
             except (RealtimeUnavailable, asyncio.CancelledError):
                 raise
             except Exception as exc:
                 self._dropped = True
                 self.feedback.log(f"error   {type(exc).__name__}: {exc}")
+
+            # The budget is meant to be consecutive failures, and it was
+            # counting the daemon's whole life. The counter only reset when a
+            # connection ended *without* being dropped — but every connection
+            # ends by being dropped, including the ones that worked: OpenAI
+            # caps a realtime session at 60 minutes, so a perfectly healthy
+            # daemon spends one attempt an hour and gives up for good after
+            # six. From this machine's log, four hours of normal service:
+            #
+            #   12:18  retry reconnecting in 4s (2/6)
+            #   13:19  error session_expired: maximum duration of 60 minutes
+            #   13:19  retry reconnecting in 8s (3/6)
+            #   13:49  error ConnectionClosedError
+            #   13:49  retry reconnecting in 16s (4/6)
+            #   14:15  error ConnectionClosedError
+            #   14:15  retry reconnecting in 30s (5/6)
+            #
+            # Nothing was wrong. It was one drop from stopping anyway, and the
+            # backoff had grown to 30 s between hour-long healthy sessions.
+            #
+            # So: a connection that stayed up long enough to be useful was not
+            # a failed reconnect, however it ended. Only genuine flapping —
+            # dropping again straight away, over and over — should spend the
+            # budget.
+            if time.monotonic() - connected_at >= RECONNECT_HEALTHY_SECONDS:
+                attempt = 0
+                delay = RECONNECT_BASE_DELAY
 
             if self._user_quit or not self._dropped:
                 return
@@ -1122,16 +1241,28 @@ class RealtimeSession:
             await asyncio.sleep(delay)
             delay = min(delay * 2, RECONNECT_MAX_DELAY)
             # Come back the way we left: if the mic was open, reopen it.
+            #
+            # The `else` is not tidiness. Without it the bar and the orb keep
+            # whatever "reconnecting (5/6)" was written above for the rest of
+            # the daemon's life, because muted is the resting state and nothing
+            # else writes the status until the next turn. This machine's state
+            # file sat on `{"status": "error", "text": "reconnecting (5/6)"}`
+            # for twenty minutes after the reconnect at 14:16 succeeded — and
+            # the orb treats "error" as awake, so it showed an urgent-tinted
+            # overlay over a working desktop until the staleness guard hid it.
             if was_listening:
                 self.active = True
                 self._active_event.set()
                 self.feedback.state("listening")
+            else:
+                self.feedback.state("idle")
 
     async def _open_one(self, url: str, headers: dict) -> None:
         """One socket, held until it closes or the user stops it."""
         mic_task: asyncio.Task | None = None
         try:
-            async with _open_socket(url, headers) as ws:
+            async with monitored_socket(_open_socket(url, headers), self.config,
+                                        self.feedback, "realtime", endpoint=url) as ws:
                 self.ws = ws
                 # A reconnect is a new conversation: the snapshot item we were
                 # tracking lives in a session that no longer exists.

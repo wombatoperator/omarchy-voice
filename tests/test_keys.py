@@ -192,3 +192,34 @@ class SendShortcutTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+class VirtualKeyboardFallbackTests(unittest.TestCase):
+    def setUp(self):
+        self.executor = Executor(Config())
+        self.executor._dispatch_lua = mock.Mock(return_value=Result(False, 'error: send_shortcut: key not found'))
+        self.executor._window_geometry = mock.Mock(return_value=({'address':'0xabc', 'focusHistoryID':0}, ''))
+        self.executor._shell = mock.Mock(return_value=Result(True, ''))
+
+    def test_key_missing_after_typing_uses_fresh_virtual_keymap(self):
+        with mock.patch('omarchy_voice.tools.shutil.which', return_value='/usr/bin/wtype'):
+            result = self.executor._tool_send_shortcut('', 'Escape', 'address:0xabc')
+        self.assertTrue(result.ok)
+        self.executor._shell.assert_called_once_with(['wtype','-k','Escape'])
+
+    def test_modifier_fallback_releases_every_modifier(self):
+        with mock.patch('omarchy_voice.tools.shutil.which', return_value='/usr/bin/wtype'):
+            result = self.executor._tool_send_shortcut('SUPER CTRL', 'a', 'address:0xabc')
+        self.assertTrue(result.ok)
+        self.executor._shell.assert_called_once_with(['wtype','-M','logo','-M','ctrl','-k','a','-m','ctrl','-m','logo'])
+
+    def test_background_target_cannot_fall_back_into_another_window(self):
+        self.executor._window_geometry.return_value=({'address':'0xabc','focusHistoryID':1}, '')
+        with mock.patch('omarchy_voice.tools.shutil.which', return_value='/usr/bin/wtype'):
+            result = self.executor._tool_send_shortcut('', 'Escape', 'address:0xabc')
+        self.assertFalse(result.ok)
+        self.executor._shell.assert_not_called()
+
+    def test_other_dispatch_errors_are_not_retried(self):
+        self.executor._dispatch_lua.return_value=Result(False,'window not found')
+        self.assertFalse(self.executor._tool_send_shortcut('', 'Escape', 'address:0xabc').ok)
+        self.executor._shell.assert_not_called()

@@ -48,9 +48,11 @@ def to_chat_tools(schemas: list[dict] | None = None) -> list[dict]:
     return converted
 
 
-def _system_prompt() -> str:
+def _system_prompt(config=None) -> str:
+    from .tasks import ROUTING
     return "\n\n".join([
         PERSONA,
+        ROUTING if config is not None and config.tasks_enabled else "",
         capabilities.manifest(),
         "# The desktop right now\n\n" + capabilities.live_state(),
     ])
@@ -87,7 +89,7 @@ class Planner:
                 "put it in ~/.config/omarchy-voice/env")
 
         messages: list[dict] = [
-            {"role": "system", "content": _system_prompt()},
+            {"role": "system", "content": _system_prompt(self.config)},
             {"role": "user", "content": text},
         ]
         tools = to_chat_tools(tools_for(self.config))

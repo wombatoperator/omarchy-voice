@@ -12,3 +12,17 @@ __pycache__/
 # Backups the installer/uninstaller leave behind
 *.bak-voice
 *.bak-voice-uninstall
+
+# Private desktop benchmark transcripts and spend ledger
+benchmarks/
+
+# Local conversations, security scans, and generated runtime evidence
+docs/private/
+*.jsonl
+*.sqlite3
+*.sqlite3-*
+*.log
+*.pem
+*.p12
+*.pfx
+.envrc

@@ -105,7 +105,11 @@ class ControlServer:
             except OSError:
                 break
             with conn:
-                command = conn.recv(65536).decode().strip()
+                conn.settimeout(1.0)
+                try:
+                    command = conn.recv(65536).decode().strip()
+                except (OSError, UnicodeError):
+                    continue
                 try:
                     reply = self.handler(command)
                 except Exception as exc:  # a bad control message must not kill the daemon

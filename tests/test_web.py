@@ -54,6 +54,9 @@ class SearchingExecutor(Executor):
         self.launched.append(cmd)
         return Result(True, "started")
 
+    def _webapp_command(self, url):
+        return ["omarchy", "launch", "webapp", url]
+
     def _query_json(self, kind):
         return [self._window] if self._window else []
 
@@ -62,6 +65,9 @@ class SearchingExecutor(Executor):
 
     def _ocr_region(self, geometry):
         return Result(True, self._page_text)
+
+    def _exact_page_text(self, target):
+        return Result(False, "selection unavailable in OCR fixture")
 
     def _dispatch_lua(self, lua):
         if "window.close" in lua:
@@ -300,3 +306,46 @@ class GateTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class VerifiedWebappTests(unittest.TestCase):
+    def test_existing_x11_webapp_is_focused_by_site_identity(self):
+        ex = SearchingExecutor(window={**WINDOW, 'class': 'Google-chrome',
+                                       'initialTitle': 'x.com_/', 'title': 'X'})
+        got = ex._tool_omarchy_cli('launch or focus webapp x https://x.com/')
+        self.assertTrue(got.ok)
+        self.assertIn('Focused', got.output)
+        self.assertEqual(ex.launched, [])
+
+    def test_x_does_not_match_netflix_or_an_unrelated_title(self):
+        ex = SearchingExecutor(window={**WINDOW, 'class': 'Google-chrome',
+                                       'initialTitle': 'netflix.com_/', 'title': 'Netflix'})
+        with mock.patch.object(ex, '_tool_open_page', return_value=Result(True, 'opened')) as opened:
+            ex._tool_omarchy_cli('launch or focus webapp x https://x.com/')
+        opened.assert_called_once_with('https://x.com/', read=False)
+
+    def test_launcher_success_without_window_is_failure(self):
+        ex = SearchingExecutor(window=None)
+        got = ex._tool_omarchy_cli('launch or focus webapp youtube https://youtube.com/')
+        self.assertFalse(got.ok)
+        self.assertIn('did not open', got.output)
+
+    def test_chrome_uses_existing_session_wrapper(self):
+        ex = Executor(Config())
+        with mock.patch('omarchy_voice.tools.subprocess.run', return_value=mock.Mock(stdout='google-chrome.desktop\n')), \
+             mock.patch('omarchy_voice.tools.shutil.which', return_value='/usr/bin/google-chrome-stable'):
+            self.assertEqual(ex._webapp_command('https://x.com/'),
+                             ['systemd-run', '--user', '--collect', '--quiet', '--service-type=exec',
+                              '--', 'google-chrome-stable', '--app=https://x.com/'])
+
+    def test_other_default_browsers_keep_omarchy_launcher(self):
+        ex = Executor(Config())
+        with mock.patch('omarchy_voice.tools.subprocess.run', return_value=mock.Mock(stdout='brave-browser.desktop\n')):
+            self.assertEqual(ex._webapp_command('https://x.com/'), ['omarchy', 'launch', 'webapp', 'https://x.com/'])
+
+    def test_unrelated_new_window_is_not_reported_as_requested_app(self):
+        ex = Executor(Config())
+        with mock.patch.object(ex, '_query_json', return_value=[{**WINDOW, 'title': 'Other', 'class': 'terminal'}]), \
+             mock.patch('omarchy_voice.tools.time.sleep'), \
+             mock.patch('omarchy_voice.tools.time.monotonic', side_effect=[0, 0, 2]):
+            self.assertIsNone(ex._await_new_window(set(), 1, 'youtube.com'))

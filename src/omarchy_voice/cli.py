@@ -60,6 +60,12 @@ def cmd_say(args, config) -> int:
 
 
 def cmd_run(args, config) -> int:
+    if config.engine == "live":
+        from . import live
+        return live.run(config)
+    if config.engine != "realtime":
+        print(f"unknown voice engine: {config.engine}", file=sys.stderr)
+        return 1
     return realtime_mod.run(config)
 
 
@@ -76,6 +82,34 @@ def cmd_listen(args, config) -> int:
         print(f"error: {exc}", file=sys.stderr)
         return 1
     return 0
+
+
+def cmd_task(args, config) -> int:
+    from .tasks import TaskManager
+    try:
+        manager = TaskManager(config)
+        action = args.task_action
+        if action == "submit":
+            spec = json.loads(Path(args.spec).read_text())
+            if config.dry_run:
+                print(json.dumps({"dry_run": True, "spec": spec}))
+                return 0
+            result = manager.submit(**spec)
+        elif action == "list":
+            result = manager.list()
+        elif action == "read":
+            result = manager.read(args.task_id, args.path, args.offset)
+        elif config.dry_run and action in {"cancel", "resume"}:
+            result = {"dry_run": True, "action": action, "task_id": args.task_id}
+        elif action == "resume":
+            result = manager.resume(args.task_id, args.guidance)
+        else:
+            result = getattr(manager, action)(args.task_id)
+        print(json.dumps(result, indent=2))
+        return 0
+    except (ValueError, TypeError, RuntimeError, OSError, subprocess.SubprocessError) as exc:
+        print(f"task error: {exc}", file=sys.stderr)
+        return 1
 
 
 def cmd_status(args, config) -> int:
@@ -105,6 +139,13 @@ def cmd_manifest(args, config) -> int:
     return 0
 
 
+def cmd_map(args, config) -> int:
+    from .discovery import lookup
+    ok, output = lookup(args.topic, " ".join(args.query), args.limit, args.offset)
+    print(output)
+    return 0 if ok else 1
+
+
 def cmd_doctor(args, config) -> int:
     print(_bold(f"omarchy-voice {__version__}\n"))
 
@@ -113,7 +154,21 @@ def cmd_doctor(args, config) -> int:
     print(f"  {_tick(key)} {config.api_key_env}"
           + ("" if key else f"  (put it in {cfg.ENV_FILE})"))
     print(f"  → planner model {config.planner_model} (`omarchy-voice say`)")
-    print(f"  → realtime model {config.realtime_model}, voice {config.realtime_voice}")
+    if config.engine == "live":
+        print(f"  → Live model {config.live_model}, voice {config.live_voice}")
+        print(f"  → backend {config.live_backend_model}, max output {config.live_max_output_tokens}")
+        print("  → Live voice: $0.05/minute plus backend usage; disconnects on mute")
+    else:
+        print(f"  → realtime model {config.realtime_model}, voice {config.realtime_voice}")
+    if config.tasks_enabled:
+        from .tasks import validate_config
+        try:
+            validate_config(config)
+            print(f"  → durable workers: {config.tasks_provider}; independent task budget {config.tasks_timeout_seconds}s")
+            for executable in ("bwrap", "systemd-run"):
+                print(f"  {_tick(bool(shutil.which(executable)))} task runtime {executable}")
+        except ValueError as exc:
+            print(f"  ✗ {exc}")
     if cfg.ENV_FILE.exists():
         mode = cfg.ENV_FILE.stat().st_mode & 0o777
         print(f"  {_tick(mode & 0o077 == 0)} {cfg.ENV_FILE} mode {mode:o}")
@@ -124,13 +179,22 @@ def cmd_doctor(args, config) -> int:
 
     print(_bold("\nears"))
     problems = realtime_mod.check_ready(config)
+    if config.engine == "live":
+        from .live import config_problems
+        problems.extend(config_problems(config))
+    elif config.engine != "realtime":
+        problems.append(f"unknown voice engine: {config.engine}")
     if problems:
         for problem in problems:
             print(f"  {_tick(False)} {problem}")
     else:
         print(f"  {_tick(True)} websockets, API key, and PipeWire tools all present")
-    print(f"  → OpenAI Realtime (speech to speech), "
-          f"{config.realtime_turn_detection}, toggle-only")
+    if config.engine == "live":
+        print("  → OpenAI Live with Responses delegation, toggle-only")
+        print(f"  → session limit {config.live_max_session_seconds:g}s; no connection at boot")
+    else:
+        print(f"  → OpenAI Realtime (speech to speech), "
+              f"{config.realtime_turn_detection}, toggle-only")
     print("  ! while listening is on, room audio streams continuously to OpenAI.")
     print("    It starts off, and only SUPER + SHIFT + V turns it on. Toggling")
     print("    off kills the recorder, so nothing is captured while muted.")
@@ -206,7 +270,7 @@ def cmd_log(args, config) -> int:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="omarchy-voice",
-        description="Drive Omarchy by voice, with OpenAI Realtime as the router.",
+        description="Drive Omarchy by voice with OpenAI Realtime or Live.",
     )
     parser.add_argument("--version", action="version", version=f"omarchy-voice {__version__}")
     parser.add_argument("-n", "--dry-run", action="store_true",
@@ -217,6 +281,22 @@ def build_parser() -> argparse.ArgumentParser:
 
     sub = parser.add_subparsers(dest="command", required=True)
 
+    p = sub.add_parser("task", help="submit and manage durable coding/experiment workers")
+    commands = p.add_subparsers(dest="task_action", required=True)
+    command = commands.add_parser("submit", help="submit a JSON specification file")
+    command.add_argument("spec")
+    command.set_defaults(func=cmd_task)
+    for action in ("list", "status", "read", "cancel", "resume"):
+        command = commands.add_parser(action)
+        if action != "list":
+            command.add_argument("task_id")
+        if action == "read":
+            command.add_argument("path")
+            command.add_argument("--offset", type=int, default=0)
+        if action == "resume":
+            command.add_argument("--guidance", default="")
+        command.set_defaults(func=cmd_task)
+
     p = sub.add_parser("say", help="run one command as if it had been spoken")
     p.add_argument("text", nargs="+")
     p.add_argument("--no-confirm", action="store_true",
@@ -224,6 +304,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.set_defaults(func=cmd_say)
 
     p = sub.add_parser("run", help="start the listening daemon")
+    p.add_argument("--engine", choices=("realtime", "live"),
+                   help="override the configured voice backend")
     p.set_defaults(func=cmd_run)
 
     p = sub.add_parser("listen", help="control a running daemon")
@@ -242,6 +324,14 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("manifest", help="print what the model knows about this machine")
     p.add_argument("--refresh", action="store_true")
     p.set_defaults(func=cmd_manifest)
+
+    from .discovery import TOPICS
+    p = sub.add_parser("map", help="explore the installed Omarchy architecture without an API call")
+    p.add_argument("topic", choices=TOPICS, nargs="?", default="overview")
+    p.add_argument("query", nargs="*")
+    p.add_argument("--limit", type=int, default=12)
+    p.add_argument("--offset", type=int, default=0)
+    p.set_defaults(func=cmd_map)
 
     p = sub.add_parser("log", help="what it heard and did")
     p.add_argument("-n", "--lines", type=int, default=40)
@@ -262,6 +352,7 @@ def main(argv: list[str] | None = None) -> int:
         dry_run=args.dry_run or None,
         verbose=args.verbose or None,
         planner_model=getattr(args, "model", None),
+        engine=getattr(args, "engine", None),
     )
     return args.func(args, config)
 

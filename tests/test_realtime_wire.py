@@ -88,6 +88,9 @@ class WireTests(unittest.IsolatedAsyncioTestCase):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
         root = Path(self.tmp.name)
+        patcher = mock.patch('omarchy_voice.network.STATE_DIR', root)
+        patcher.start()
+        self.addCleanup(patcher.stop)
         for module, names in ((feedback, ("LOG_FILE", "STATE_FILE", "STATE_DIR", "RUNTIME_DIR")),
                               (session_mod, ("SOCKET_PATH", "RUNTIME_DIR")),
                               (realtime, ("SAFETY_ID_FILE", "CONFIG_DIR"))):

@@ -5,6 +5,9 @@ set -euo pipefail
 
 PREFIX="${PREFIX:-$HOME/.local/share/omarchy-voice}"
 BINDIR="${BINDIR:-$HOME/.local/bin}"
+SOURCE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "$SOURCE/share/install-paths.sh"
+validate_install_prefix "$PREFIX" "$SOURCE"
 
 systemctl --user disable --now omarchy-voice.service 2>/dev/null || true
 rm -f "$HOME/.config/systemd/user/omarchy-voice.service"
@@ -19,11 +22,13 @@ for route in "" -start -stop -toggle -confirm -cancel -say -doctor -log -manifes
   target="$OMARCHY_BIN/omarchy-voice$route"
   [[ -f $target ]] && sudo rm -f "$target"
 done
-rm -rf "$HOME/.cache/omarchy-voice" "$HOME/.local/state/omarchy-voice"
+rm -rf "$HOME/.cache/omarchy-voice"
 
 if [[ "${1:-}" == "--purge" ]]; then
-  rm -rf "$HOME/.config/omarchy-voice"
-  echo "removed config too"
+  rm -rf "$HOME/.config/omarchy-voice" "$HOME/.local/state/omarchy-voice"
+  echo "removed config, logs, and task artifacts too"
+else
+  echo "kept config, logs, and task artifacts; --purge removes them"
 fi
 
 # --- keybindings -----------------------------------------------------------

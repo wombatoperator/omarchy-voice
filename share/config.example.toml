@@ -10,6 +10,51 @@ api_key_env = "OPENAI_API_KEY"
 # stops and waits to be asked again. Multi-step goals need the room; every
 # round is also a turn against the API's per-minute token budget.
 max_turns = 12
+# Voice daemon backend. Realtime remains the default during Live evaluation.
+engine = "realtime"       # realtime | live; or `omarchy-voice run --engine live`
+
+[live]
+model = "gpt-live-1"
+voice = "marin"
+backend_model = "gpt-5.6-terra"
+sample_rate = 24000       # 16000 or 24000; raw mono PCM16
+reasoning_effort = "low"
+service_tier = "default"  # priority requests faster processing at higher backend token prices
+# Concurrent independent calls; shared focus/layout actions stay ordered.
+max_parallel_tools = 4
+# Complex browser tasks go to a bounded Astra computer-use worker.
+browser_enabled = true
+browser_max_turns = 8
+browser_timeout_seconds = 90
+browser_max_output_tokens = 1024
+# Small jitter buffer, adaptive up to 240 ms after playback starvation.
+playback_buffer_ms = 120
+max_output_tokens = 2048
+# Live costs $0.05 per connected minute PLUS backend tokens (2026-09-10).
+# No session at boot; toggle off closes it. Limit pauses until you toggle on.
+max_session_seconds = 1800
+# A typed `listen say` can open a session without opening the microphone.
+# Close after this much inactivity once its backend work and playback finish.
+typed_idle_seconds = 15
+
+[tasks]
+# General coding, analysis and experiment workers; independent of voice sessions.
+enabled = true
+provider = "responses"  # responses | codex
+model = "gpt-6-astra"   # Responses only; Codex uses its default with user config disabled
+# root = "/home/you/Documents/oma-tasks"  # default: private OMA state directory / tasks
+max_active = 1         # avoid competing GPU experiments by default
+timeout_seconds = 1800
+max_model_calls = 24   # Responses only; each task resume gets a new bounded attempt
+max_output_tokens = 8192
+command_timeout_seconds = 600
+max_log_bytes = 8388608
+# These are workload limits, not a dollar cap. No worker/API request starts at boot.
+# Each submission records whether its programs may use the network (default false).
+
+[navigation]
+# Your personal news workspace. Empty means OMA asks instead of guessing.
+news_sources = []
 
 [ears]
 # Listening always starts off. SUPER + SHIFT + V, or the bar widget, turns it
@@ -51,3 +96,11 @@ cancel_words = ["cancel", "never mind", "nevermind"]
 notify = true
 speak  = false            # needs piper or espeak-ng
 # tts_command = "piper-say"
+
+# Diagnostics on the existing voice socket (Live and Realtime).
+# Writes session.log and network-trace.jsonl; Live also includes its own trace.
+# Ping/Pong RTT is transport latency, not model response time.
+[network]
+enabled = true
+interval_seconds = 20.0
+timeout_seconds = 5.0

@@ -8,6 +8,8 @@ PLUGINDIR="$HOME/.config/omarchy/plugins"
 CONFIGDIR="$HOME/.config/omarchy-voice"
 UNITDIR="$HOME/.config/systemd/user"
 SOURCE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "$SOURCE/share/install-paths.sh"
+validate_install_prefix "$PREFIX" "$SOURCE"
 
 bold() { printf '\033[1m%s\033[0m\n' "$*"; }
 step() { printf '\033[1;34m::\033[0m %s\n' "$*"; }
@@ -33,7 +35,7 @@ pacman_install() {
 }
 
 bold "omarchy-voice installer"
-echo "OpenAI Realtime speech-to-speech, driving Omarchy."
+echo "OpenAI Live or Realtime voice control for Omarchy."
 echo
 
 # --- sanity ----------------------------------------------------------------
@@ -51,6 +53,7 @@ step "installing to $PREFIX"
 mkdir -p "$PREFIX" "$BINDIR" "$CONFIGDIR"
 rm -rf "$PREFIX/src" "$PREFIX/bin" "$PREFIX/share" "$PREFIX/omarchy" "$PREFIX/.venv"
 cp -r "$SOURCE/src" "$SOURCE/bin" "$SOURCE/share" "$SOURCE/omarchy" "$PREFIX/"
+touch "$PREFIX/.omarchy-voice-install"
 chmod +x "$PREFIX/bin/omarchy-voice"
 ln -sf "$PREFIX/bin/omarchy-voice" "$BINDIR/omarchy-voice"
 echo "   omarchy-voice -> $BINDIR/omarchy-voice"

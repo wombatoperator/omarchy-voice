@@ -583,6 +583,93 @@ class ReconnectTests(unittest.IsolatedAsyncioTestCase):
         # It went back to listening rather than coming up muted.
         self.assertTrue(self.session.active)
 
+    # -- the budget is consecutive failures, not a lifetime allowance --------
+    #
+    # Scaled down rather than clock-faked: time.monotonic is the clock the
+    # event loop schedules against, so patching it means asyncio.sleep never
+    # comes back and the suite hangs. A "healthy" session here outlives a 20 ms
+    # threshold; a flapping one returns at once. Same semantics, and the test
+    # finishes.
+
+    HEALTHY = 0.02
+
+    async def serve_with(self, open_one, attempts=3):
+        with mock.patch.object(self.session, "_open_one", side_effect=open_one), \
+             mock.patch.object(realtime, "RECONNECT_HEALTHY_SECONDS", self.HEALTHY), \
+             mock.patch.object(realtime, "RECONNECT_ATTEMPTS", attempts), \
+             mock.patch.object(realtime, "RECONNECT_BASE_DELAY", 0.001), \
+             mock.patch.object(realtime, "RECONNECT_MAX_DELAY", 0.001):
+            await self.session._serve("wss://x", {})
+        return (Path(self.tmp.name) / "session.log").read_text()
+
+    async def test_session_expiry_does_not_spend_the_budget(self):
+        """The server caps a realtime session at 60 minutes, so EVERY
+        connection ends by dropping — the healthy ones included. Counting
+        those against the cap killed this daemon after six good hours."""
+        sessions = []
+
+        async def serve_then_expire(url, headers):
+            sessions.append(1)
+            await asyncio.sleep(self.HEALTHY * 2)     # a full, useful session
+            if len(sessions) > 8:
+                self.session._user_quit = True
+                return
+            self.session._dropped = True              # "maximum duration ..."
+
+        log = await self.serve_with(serve_then_expire, attempts=3)
+        # Eight expiries against a budget of three, and still serving.
+        self.assertEqual(len(sessions), 9)
+        self.assertEqual(self.session._exit_code, 0)
+        self.assertNotIn("gave up", log)
+
+    async def test_a_genuinely_flapping_socket_still_gives_up(self):
+        """The cap has to keep working, or a dead network retries forever."""
+        async def drops_at_once(url, headers):
+            self.session._dropped = True
+
+        log = await self.serve_with(drops_at_once, attempts=3)
+        self.assertEqual(self.session._exit_code, 1)
+        self.assertIn("gave up", log)
+
+    async def test_the_backoff_resets_after_a_healthy_session(self):
+        """Otherwise a good long session is followed by a 30 s wait."""
+        sessions = []
+
+        async def serve_then_expire(url, headers):
+            sessions.append(1)
+            await asyncio.sleep(self.HEALTHY * 2)
+            if len(sessions) > 3:
+                self.session._user_quit = True
+                return
+            self.session._dropped = True
+
+        log = await self.serve_with(serve_then_expire, attempts=6)
+        # Every retry is the first retry: none of them ever reaches (2/6).
+        self.assertIn("(1/6)", log)
+        self.assertNotIn("(2/6)", log)
+
+    async def test_a_recovered_reconnect_stops_saying_error(self):
+        """Muted is the resting state, and nothing else writes the status, so
+        without clearing it the bar and the orb keep 'reconnecting (1/6)' for
+        the rest of the daemon's life — and the orb treats error as awake, so
+        it holds an urgent-tinted overlay over a working desktop."""
+        calls = []
+
+        async def drop_once(url, headers):
+            calls.append(1)
+            if len(calls) == 1:
+                self.session._dropped = True
+            else:
+                self.session._user_quit = True
+
+        self.assertFalse(self.session.active)          # muted, the resting state
+        with mock.patch.object(self.session, "_open_one", side_effect=drop_once), \
+             mock.patch.object(realtime, "RECONNECT_BASE_DELAY", 0.01), \
+             mock.patch.object(realtime, "RECONNECT_MAX_DELAY", 0.01):
+            await self.session._serve("wss://x", {})
+        state = json.loads((Path(self.tmp.name) / "state.json").read_text())
+        self.assertEqual(state["status"], "idle")
+
 
 
 if __name__ == "__main__":
@@ -740,6 +827,250 @@ class EchoGateTests(unittest.TestCase):
 
     def test_barge_in_can_be_turned_back_on_for_headphones(self):
         self.assertTrue(Config(barge_in=True).barge_in)
+
+
+class MicrophoneGateTests(unittest.IsolatedAsyncioTestCase):
+    """The gate as the microphone actually sees it, not as Speaker reports it.
+
+    EchoGateTests above covers Speaker's bookkeeping, and every one of those
+    tests passed for a whole release while `_mic_loop` appended every frame
+    unconditionally: `is_playing` was never called, `_held_frames` was never
+    incremented, `ECHO_TAIL_SECONDS` was never read. The feature was tested at
+    the accessor and absent from the audio path, which is the one place it has
+    to exist. So these tests drive the loop and assert on what reached the
+    wire.
+    """
+
+    # 100 ms of 24 kHz PCM16, loud enough to clear the meter's noise gate:
+    # frame_level reads it as 0.6, "normal speech". A quieter frame would read
+    # 0.0 whether or not the gate held it, which would make the orb assertion
+    # below pass for the wrong reason.
+    FRAME = b"\x00\x20" * 2400
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        root = Path(self.tmp.name)
+        for name, value in (("LOG_FILE", root / "session.log"),
+                            ("STATE_FILE", root / "state.json"),
+                            ("STATE_DIR", root),
+                            ("RUNTIME_DIR", root)):
+            patcher = mock.patch.object(feedback, name, value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        self.addCleanup(self.tmp.cleanup)
+        self.log = root / "session.log"
+
+    async def run_mic(self, frames, config=None, speaking=0.0):
+        """Run _mic_loop over `frames`, with her voice booked `speaking` seconds.
+
+        `frames` may hold the string "quiet", which stops the playback booking
+        at that point — the way a barge-in or the end of a reply reopens the
+        gate part way through a capture.
+        """
+        session = realtime.RealtimeSession(config or Config(dry_run=True, notify=False))
+        socket = FakeSocket()
+        session.ws = socket
+        session._active_event.set()
+        if speaking:
+            session.speaker._plays_until = time.monotonic() + speaking
+
+        # (yours, hers) as published to the orb.
+        levels = []
+        session.feedback.level = lambda mic, voice=0.0: levels.append((mic, voice))
+
+        queue = list(frames)
+
+        class Stdout:
+            async def read(self, _n):
+                while queue:
+                    item = queue.pop(0)
+                    if item == "quiet":
+                        session.speaker._plays_until = 0.0
+                        continue
+                    return item
+                # EOF is how a capture ends; stop the session so the outer
+                # loop does not spawn a second recorder.
+                session._stop.set()
+                return b""
+
+        class Proc:
+            returncode = None
+            stdout = Stdout()
+
+            def terminate(self):
+                self.returncode = 0
+
+            async def wait(self):
+                self.returncode = 0
+                return 0
+
+        with mock.patch.object(realtime.asyncio, "create_subprocess_exec",
+                               new=mock.AsyncMock(return_value=Proc())):
+            await asyncio.wait_for(session._mic_loop(), timeout=5)
+        appended = socket.events("input_audio_buffer.append")
+        return session, appended, levels
+
+    async def test_her_own_voice_never_reaches_the_wire(self):
+        """The bug, stated as a test: four frames captured while she is
+        speaking, and the server must be sent none of them."""
+        session, appended, _ = await self.run_mic([self.FRAME] * 4, speaking=5.0)
+        self.assertEqual(appended, [])
+        self.assertEqual(session._held_frames, 4)
+
+    async def test_a_quiet_room_is_sent_normally(self):
+        """The gate must not be a mute button: with nothing playing, every
+        frame goes."""
+        _, appended, _ = await self.run_mic([self.FRAME] * 4, speaking=0.0)
+        self.assertEqual(len(appended), 4)
+
+    async def test_the_microphone_reopens_when_she_stops(self):
+        """Two frames held while she talks, two sent once the room is quiet."""
+        session, appended, _ = await self.run_mic(
+            [self.FRAME, self.FRAME, "quiet", self.FRAME, self.FRAME], speaking=5.0)
+        self.assertEqual(len(appended), 2)
+        self.assertEqual(session._held_frames, 0)      # reset when it reopened
+        self.assertIn("mic     held 2 frames while speaking", self.log.read_text())
+
+    async def test_the_tail_outlasts_the_audio(self):
+        """A room rings after playback ends. A frame arriving inside the tail
+        is still her, so it is still held."""
+        session, appended, _ = await self.run_mic(
+            [self.FRAME], speaking=-realtime.ECHO_TAIL_SECONDS / 2)
+        self.assertFalse(session.speaker.is_playing())   # playback itself is over
+        self.assertEqual(appended, [])                   # and yet: still held
+
+    async def test_the_orb_does_not_twitch_on_her_own_voice(self):
+        """A held frame is not being heard. Showing its loudness on the meter
+        reads as 'it is listening to you' while the gate is shut."""
+        _, _, levels = await self.run_mic([self.FRAME] * 3, speaking=5.0)
+        self.assertEqual([mic for mic, _ in levels if mic > 0.0], [])
+
+    async def test_her_voice_reaches_the_orb_while_the_mic_is_held(self):
+        """The gate silences the input meter for the length of every reply. If
+        that were the only channel the orb would go dead still whenever she
+        talks, so her own loudness has to arrive on the second one."""
+        session = realtime.RealtimeSession(Config(dry_run=True, notify=False))
+        socket = FakeSocket()
+        session.ws = socket
+        session._active_event.set()
+        levels = []
+        session.feedback.level = lambda mic, voice=0.0: levels.append((mic, voice))
+        # A second of her, loud, already booked for playback.
+        with mock.patch.object(realtime.asyncio, "create_task"):
+            await session.speaker.write(b"\x00\x20" * 24000)
+
+        queue = [self.FRAME] * 3
+
+        class Stdout:
+            async def read(self, _n):
+                if queue:
+                    return queue.pop(0)
+                session._stop.set()
+                return b""
+
+        class Proc:
+            returncode = None
+            stdout = Stdout()
+
+            def terminate(self):
+                self.returncode = 0
+
+            async def wait(self):
+                self.returncode = 0
+                return 0
+
+        with mock.patch.object(realtime.asyncio, "create_subprocess_exec",
+                               new=mock.AsyncMock(return_value=Proc())):
+            await asyncio.wait_for(session._mic_loop(), timeout=5)
+
+        self.assertEqual(socket.events("input_audio_buffer.append"), [])   # held
+        self.assertEqual([mic for mic, _ in levels if mic > 0.0], [])      # meter flat
+        self.assertTrue([voice for _, voice in levels if voice > 0.0],
+                        "her own voice never reached the orb")
+
+    async def test_barge_in_hands_the_interruption_back(self):
+        """Headphones or PipeWire echo cancellation: there is no leak to gate,
+        and holding the mic would only stop the user cutting in."""
+        config = Config(dry_run=True, notify=False, barge_in=True)
+        session, appended, _ = await self.run_mic(
+            [self.FRAME] * 4, config=config, speaking=5.0)
+        self.assertEqual(len(appended), 4)
+        self.assertEqual(session._held_frames, 0)
+
+
+class SpeechMeterTests(unittest.TestCase):
+    """What the orb is told about her own voice."""
+
+    def setUp(self):
+        self.speaker = realtime.Speaker(rate=24000)
+
+    def write(self, pcm):
+        with mock.patch.object(realtime.asyncio, "create_task"):
+            asyncio.run(self.speaker.write(pcm))
+
+    QUIET = (0x0040).to_bytes(2, "little")      # below the meter's noise gate
+    LOUD = (0x2000).to_bytes(2, "little")       # reads as normal speech
+
+    def test_a_silent_speaker_reads_zero(self):
+        self.assertEqual(self.speaker.level_now(), 0.0)
+
+    def test_loudness_is_booked_on_the_playback_clock_not_arrival(self):
+        """Half a second of quiet then half a second of loud arrives as one
+        chunk off the socket. The meter must report quiet now and loud later,
+        or it runs a second ahead of the speakers."""
+        self.write(self.QUIET * 12000 + self.LOUD * 12000)
+        self.assertEqual(self.speaker.level_now(), 0.0)
+        loud = [level for _, _, level in self.speaker._envelope if level > 0.0]
+        self.assertTrue(loud, "the loud half was never booked")
+        self.assertAlmostEqual(loud[0], 0.6, delta=0.05)
+
+    def test_a_chunk_is_sliced_rather_than_flattened(self):
+        """One level for a whole delta would make the meter a staircase."""
+        self.write(self.LOUD * 24000)                      # one second
+        self.assertEqual(len(self.speaker._envelope),
+                         int(1.0 / realtime.METER_SLICE))
+
+    def test_a_barge_in_stops_her_mid_word(self):
+        """Dropping queued audio must clear the envelope too, or the orb goes
+        on breathing with a reply that was cut off."""
+        self.write(self.LOUD * 240000)                     # ten seconds
+        self.assertGreater(self.speaker.level_now(), 0.0)
+        self.speaker._drop_queued()
+        self.assertEqual(self.speaker.level_now(), 0.0)
+
+
+class LevelFileTests(unittest.TestCase):
+    """The orb reads this file 16 times a second; its format is an interface."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.path = Path(self.tmp.name) / "level"
+        for name, value in (("LEVEL_FILE", self.path),
+                            ("STATE_FILE", Path(self.tmp.name) / "state.json"),
+                            ("STATE_DIR", Path(self.tmp.name)),
+                            ("RUNTIME_DIR", Path(self.tmp.name))):
+            patcher = mock.patch.object(feedback, name, value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        self.feedback = feedback.Feedback(Config(notify=False))
+
+    def publish(self, mic, voice=0.0):
+        self.feedback._level_at = 0.0          # defeat the 20 Hz cap
+        self.feedback.level(mic, voice)
+        return self.path.read_text()
+
+    def test_both_voices_are_published(self):
+        self.assertEqual(self.publish(0.5, 0.25), "0.500 0.250")
+
+    def test_the_microphone_stays_the_first_field(self):
+        """parseFloat stops at the space, so a reader written against the old
+        single-float format still gets the microphone level and simply never
+        learns there is a second channel."""
+        self.assertEqual(float(self.publish(0.75, 0.5).split()[0]), 0.75)
+
+    def test_levels_are_clamped_to_the_range_the_orb_expects(self):
+        self.assertEqual(self.publish(9.0, -3.0), "1.000 0.000")
 
 
 class EchoRiskTests(unittest.TestCase):

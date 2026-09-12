@@ -1,8 +1,21 @@
 # omarchy-voice
 
-Operate Omarchy by talking to it. Speech goes to OpenAI Realtime; the only
-thing that runs on this machine is the policy gate and the Omarchy / Hyprland
-tools.
+Read [SECURITY.md](SECURITY.md) before enabling desktop automation. It explains
+what leaves the machine, the limits of the policy gate and worker sandbox, and
+how to report vulnerabilities privately. See [diagnostics](docs/diagnostics.md)
+for latency logging and safe sharing of troubleshooting evidence.
+
+GPT-Live is available as an optional voice backend with a separate task model.
+See [Live setup, costs, and switching back](docs/live.md). Select it with
+`omarchy-voice run --engine live`; Realtime remains the default.
+
+OMA also has [durable task workers](docs/task-workers.md) for coding, experiments,
+simulations and analysis. They can use a direct Responses worker or the installed
+Codex CLI, preserve files and process results across voice sessions, and run
+acceptance checks before reporting completion.
+
+Operate Omarchy by talking to it. Speech goes to OpenAI Live or Realtime;
+audio handling, the policy gate, and Omarchy / Hyprland tools run locally.
 
 ```
 you   "put my email on workspace three, then go there"
@@ -67,7 +80,9 @@ cd omarchy-voice
 ./install.sh
 ```
 
-The installer asks before each step and is safe to re-run. It writes a
+The installer copies application files, then asks before optional desktop integration.
+Run it as your desktop user, not with `sudo`. It validates the install directory
+before replacing existing application files. It writes a
 mode-600 `~/.config/omarchy-voice/env` for `OPENAI_API_KEY`, puts the
 keybindings in `~/.config/hypr/bindings.lua` (backing the file up first),
 places the bar widget, and reloads Hyprland.
@@ -105,6 +120,8 @@ nothing to leak. `SUPER + V` (Universal paste) and `SUPER + CTRL + V`
 
 `./uninstall.sh` reverses all of it, including taking its own block back out of
 `bindings.lua` and its widget out of the bar.
+Configuration, logs, and task artifacts are preserved unless `--purge` is passed.
+Cancel background workers before uninstalling or purging their files.
 
 ## Use
 
@@ -171,8 +188,7 @@ it    "It shows Bitcoin at about 79,148 dollars and 79 cents."
 The query goes in the **URL** and the results open as their own window. Nothing
 is typed, which matters more than it sounds: the web panes on an Omarchy desktop
 are `chrome --app=<url>` windows with no tab bar and no address bar, so `CTRL+T`
-and `CTRL+L` are no-ops and there is nowhere for a typed query to go. A session
-log of the assistant discovering that, the hard way, is in `HANDOFF.md`.
+and `CTRL+L` are no-ops and there is nowhere for a typed query to go.
 
 `scope` picks the page: `web` (Google, whose answer panel often answers outright),
 `news`, `images`, `videos`, or `duckduckgo` for a plain list of links. `images`
@@ -274,8 +290,8 @@ cannot make the budget bigger. If Oma feels like it is pausing between
 sentences, that is what is happening — check your tier at
 [platform.openai.com/account/rate-limits](https://platform.openai.com/account/rate-limits).
 
-`tools/bench_realtime.py` measures time-to-first-action across realtime models
-on this machine.
+For Live connection and tool-round-trip QA, use `tools/bench_live.py --connect`.
+See [Live setup and QA](docs/live.md).
 
 Reach costs tokens. The tools above add about 2,000 to every turn — roughly one
 turn a minute — which is the price of Oma being able to finish a multi-step job
@@ -326,6 +342,10 @@ have turned barge-in on with both ends on the same box.
 An open microphone is an untrusted input channel. The model's decisions are
 not trusted blindly:
 
+These controls reduce mistakes; they are not a sandbox for desktop actions.
+Terminal execution and browser/application automation still have your user-level
+authority. See [the threat model and reporting policy](SECURITY.md).
+
 - **Denied outright**: `rm -rf`, `dd`, `mkfs`, `sudo`, `pkexec`, `ssh`,
   `passwd`, piping curl into a shell, `git push`.
 - **Held for confirmation**: shutdown, reboot, suspend, package installs,
@@ -334,6 +354,8 @@ not trusted blindly:
   `launch_app` command lines. Apps launch by desktop id; URLs must be
   `http(s)`. `allow_shell = true` is the only way around that.
 - **Off by default**: the shell tool.
+- **Literal dispatch arguments only**: the Hyprland tool rejects embedded Lua
+  expressions, functions, additional statements, and comments.
 - **Leaves the machine**: `read_screen` sends a picture of the screen, and
   `clipboard` read sends whatever you last copied. Both go to OpenAI along with
   the audio. `read_screen` and `click_text` refuse outright when the session is
@@ -374,6 +396,10 @@ To open a PR against Omarchy itself you would typically:
 3. Point the plugin's `onPressed` at `omarchy-voice` on `PATH`.
 
 `python3 -m unittest discover -s tests` is the gate before you push.
+
+See the [Omarchy architecture map](docs/omarchy-architecture.md) for how OMA
+discovers commands, current shortcuts, apps, plugins and configuration.
+Run `bin/omarchy-voice map` to explore it locally without an API request.
 
 ## Bar widget
 
