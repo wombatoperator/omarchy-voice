@@ -11,6 +11,12 @@
 #
 # Never `exec omarchy-voice`: the wrapper for the bare `omarchy voice` route
 # is itself named omarchy-voice, so a PATH lookup would find this file again.
+#
+# That name is shared with the CLI, and on any PATH carrying the omarchy bin
+# directory ahead of ~/.local/bin this file answers to it. Quickshell's PATH
+# does, so the bar widget's `omarchy-voice listen toggle` lands here, and so
+# does anything typed in a terminal. Arguments are passed straight through
+# rather than forced after `status`, or clicking the indicator does nothing.
 
 set -euo pipefail
 
@@ -19,4 +25,10 @@ set -euo pipefail
 SRC="${OMARCHY_VOICE_SRC:-$HOME/.local/share/omarchy-voice/src}"
 [[ -d $SRC ]] && export PYTHONPATH="$SRC${PYTHONPATH:+:$PYTHONPATH}"
 
-exec python3 -m omarchy_voice status "$@"
+# `omarchy voice` on its own is the status route; anything else is a real
+# omarchy-voice command line.
+if [[ $# -eq 0 ]]; then
+  exec python3 -m omarchy_voice status
+fi
+
+exec python3 -m omarchy_voice "$@"
