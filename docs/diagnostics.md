@@ -77,6 +77,86 @@ and local scheduling. A fast ping does not establish that model inference is
 fast. First-output timing may measure filler speech rather than the final answer.
 No single metric proves a root cause.
 
+### Experimental Jev navigation replay
+
+[`tools/eval_navigation.py`](../tools/eval_navigation.py) evaluates explicitly
+selected requests with TypeSafe's Jev model. It is a development experiment and
+does not change either voice engine or execute desktop actions. Jev selects
+among supplied candidates; the application would still need to discover current
+windows/controls, construct complete actions, apply the existing policy gate,
+verify outcomes, and fall back to its planner.
+
+The [TypeSafe quickstart](https://docs.typesafe.ai/introduction/quickstart),
+[function-calling cookbook](https://docs.typesafe.ai/cookbooks/function_calling),
+and [confidence guide](https://docs.typesafe.ai/confidence) describe this model.
+It cannot generate arbitrary tool arguments, search queries, shell commands,
+or spoken responses. Confidence is derived from the option distribution and
+is not a guarantee that a proposed action is correct.
+
+Create a reviewed JSON array under ignored `benchmarks/` or `docs/private/`.
+This example is synthetic:
+
+```json
+[
+  {
+    "state": {"request": "Show workspace two"},
+    "candidates": {
+      "workspace_2": "Switch to workspace 2; do nothing else.",
+      "workspace_3": "Switch to workspace 3; do nothing else.",
+      "fallback": "No single listed action fully satisfies the request."
+    },
+    "expected": "workspace_2"
+  }
+]
+```
+
+Each case must include `fallback`. Put only necessary evidence in `state`, such
+as the completed request and observed window/control descriptions. Label cases
+before evaluation; the `expected` label is never sent to the model. Reconstruct
+transcript fragments in session/utterance order and review their boundaries.
+Missing historical desktop state cannot be repaired by inventing a target and
+then treating it as ground truth. Include ambiguous targets, missing candidates,
+corrections, compound requests, and instruction-like page text.
+
+```sh
+# Validate locally; no API calls and no credential file read.
+python3 tools/eval_navigation.py benchmarks/navigation-cases.json
+
+# Explicit paid probe: sends the selected cases to TypeSafe.
+# Configure JEV_API_KEY privately; --key-env TYPESAFE_API_KEY is also supported.
+python3 tools/eval_navigation.py benchmarks/navigation-cases.json \
+  --connect --env-file ~/.config/omarchy-voice/env --limit 20 \
+  --output benchmarks/navigation-results.json
+```
+
+Never commit case files, historical transcripts, or generated reports. Obtain
+permission before sending private historical inputs to an additional provider.
+The tool sends a Choice and an independent Noul eligibility question in one
+request. It validates distributions and accepts a shadow decision only when
+selection probability, confidence, and eligibility all reach `--threshold`
+(initially 0.90). This threshold is experimental, not calibrated for OMA.
+Invalid output and transport errors stop the run without retries. Requests use
+a fixed HTTPS endpoint, reuse the connection, and never follow redirects. The
+default socket timeout is five seconds; it is not an end-to-end deadline.
+`--limit` and `--repeat` cap each invocation at 100 calls; they are not dollar caps.
+
+Reports are created without overwriting existing files, with owner-only file
+permissions inside an ignored directory. They contain numeric case indices,
+timings, decision scores, returned model identifiers when available, and token
+usage, but no request text or raw provider bodies. Keep the reviewed case file
+locally to interpret those indices. `jev-latest` is mutable; pin `--model` to a
+provider-supported version when comparing runs.
+
+Compare raw selection accuracy, accepted coverage, wrong accepted decisions,
+fallback accuracy, and cold/warm median and p95 request latency. An error is not
+counted as a correct fallback. High raw accuracy with every request falling back
+does not produce a speedup. Use separate development and held-out cases when
+choosing thresholds. Repeated requests are not independent accuracy samples.
+Historical backend timings are context only: a fair speed comparison needs the
+same inputs and candidate set, plus discovery, execution, verification, fallback,
+and speech costs. Measure end-of-speech to first correct action before enabling
+any runtime routing.
+
 Live transcript state is coalesced and written outside the event loop. Live
 actions wait for their journal receipt before executing; cancellation serializes pending
 writes. Abrupt crashes may lose recent unflushed transcript fragments. Unknown
