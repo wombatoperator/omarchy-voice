@@ -125,9 +125,12 @@ group positions 1–5, and the packaged resize increments are currently enumerat
 Named nonfocused window mutations, arbitrary dimensions, free text, URLs,
 conditional/compound requests, and interpretive tasks defer to GPT. A request to
 set a particular fullscreen/floating state cannot safely become a toggle without
-state evidence. Missing or uncertain arguments also defer. Every question runs
-independently; the action and its required arguments must each pass the configured
-confidence threshold. Confidence does not establish permission or correctness.
+state evidence. Missing or uncertain arguments also defer.
+`--representation slots` asks independent action and argument questions; the action and required arguments must pass the
+threshold. `--representation candidates` expands templates into complete action/target
+choices and asks Jev to select one. It gates selection certainty and a separate
+whole-request eligibility question. More than 254 complete candidates is an explicit
+error, never silent truncation. Confidence does not establish permission or correctness.
 
 Run from the repository root:
 
@@ -140,10 +143,15 @@ python3 tools/bench_navigation.py --connect --provider jev \
   --split development --env-file .env \
   --output benchmarks/jev/development.json
 
-# Interleave providers on separate paraphrases and requests that should defer.
+# Interleave providers on paraphrases and requests that should defer.
 python3 tools/bench_navigation.py --connect --provider both \
   --split held_out --repeat 2 --env-file .env \
   --output benchmarks/jev/comparison.json
+
+# Confirm a calibrated complete-candidate strategy on a separate case set.
+python3 tools/bench_navigation.py --connect --provider both \
+  --representation candidates --threshold 0.8 --split confirmation --repeat 2 \
+  --env-file .env --output benchmarks/jev/confirmation.json
 ```
 
 The key names default to `JEV_API_KEY` and `OPENAI_API_KEY`; `--jev-key-env` can
@@ -160,9 +168,12 @@ The report separates raw selection accuracy, accepted decisions, wrong accepted
 actions, eligible commands correctly handled, and HTTP median/p95 latency. Unused
 argument slots do not affect correctness or acceptance. Cold and reused-connection
 samples are reported separately. Development cases intentionally cover catalogue
-wording; held-out cases use separate paraphrases and rejection scenarios. Once a
-held-out set informs prompt changes, treat it as development data and create a
-new evaluation set before claiming generalization.
+wording. The original `held_out` paraphrases and rejection cases were subsequently
+used to calibrate the complete-candidate experiment, so they are now calibration
+data. The separate `confirmation` set was authored after calibration and before
+running the revised strategy. It includes 32 eligible commands and 16 requests
+that should defer, without copying user speech. Once any set informs prompt or
+threshold changes, create fresh cases before claiming generalization.
 
 The OpenAI comparison uses one Responses decision with low reasoning, standard
 processing, the same inventory and action/argument choices, and forced structured

@@ -2,6 +2,8 @@
 import contextlib
 import copy
 import io
+import json
+import tempfile
 from pathlib import Path
 import sys
 import unittest
@@ -29,7 +31,49 @@ def response(action='workspace', **slots):
     return {'answers': answers}
 
 
+def candidate_response(key='workspace:4'):
+    options = nav.candidates(INVENTORY)
+    return {'answers': {
+        'selection': {'type': 'choice', 'choice': key, 'confidence': 1.0,
+                      'probabilities': {k: float(k == key) for k in [*options, 'fallback']}},
+        'supported': {'type': 'noul', 'noul': 1.0}}}
+
+
 class NavigationTests(unittest.TestCase):
+    def test_complete_candidates_preserve_action_and_argument_together(self):
+        result = nav.decide_candidate(candidate_response('send_workspace:6'), INVENTORY)
+        self.assertTrue(result['accepted'])
+        self.assertEqual(result['selection'], {'action': 'send_workspace', 'workspace': '6'})
+        self.assertIn('follow = false', result['call']['arguments']['lua'])
+        self.assertIn('workspace = "6"', result['call']['arguments']['lua'])
+
+    def test_candidate_distribution_rounding_boundary_and_rejection(self):
+        for total, valid in ((.99, True), (1.01, True), (1.02, False), (.98, False)):
+            data = candidate_response()
+            data['answers']['selection']['probabilities']['workspace:4'] = .98
+            data['answers']['selection']['probabilities']['fallback'] = total - .98
+            self.assertEqual(nav.decide_candidate(data, INVENTORY)['valid'], valid)
+        data = candidate_response()
+        data['answers']['selection']['choice'] = 'unlisted'
+        self.assertFalse(nav.decide_candidate(data, INVENTORY)['valid'])
+        data = candidate_response()
+        data['answers']['supported']['noul'] = .1
+        self.assertFalse(nav.decide_candidate(data, INVENTORY)['accepted'])
+
+    def test_complete_candidate_overflow_is_explicit(self):
+        inventory = {**INVENTORY, 'apps': [{'id': f'example-{i}'} for i in range(200)]}
+        with self.assertRaises(ValueError):
+            nav.candidate_payload('Open the calculator', inventory)
+
+    def test_openai_complete_choice_uses_the_same_local_compiler(self):
+        data = {'output': [{'type': 'function_call', 'name': 'select_navigation',
+                           'arguments': json.dumps({'selection': 'focus_window:w1'})}]}
+        decision = bench.openai_decision(data, INVENTORY, 'candidates')
+        self.assertEqual(decision['call']['arguments']['lua'], 'hl.dsp.focus({ window = "address:0x102" })')
+        data['output'][0]['arguments'] = json.dumps({'selection': 'run_shell'})
+        with self.assertRaises(ValueError):
+            bench.openai_decision(data, INVENTORY, 'candidates')
+
     def test_workspace_switch_never_renames_and_move_preserves_follow(self):
         result = nav.decide(response(workspace='4'), INVENTORY)
         self.assertEqual(result['call'], {'name': 'hypr_dispatch', 'arguments': {'lua': 'hl.dsp.focus({ workspace = "4" })'}})
@@ -97,6 +141,30 @@ class NavigationTests(unittest.TestCase):
             self.assertFalse(result.ok)
             dispatch.assert_not_called()
             self.assertEqual(bool(executor.pending), field == 'confirm_patterns')
+
+    def test_benchmark_stops_on_provider_failure_and_keeps_partial_results_private(self):
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.object(Path, 'cwd', return_value=Path(tmp)):
+            output = Path(tmp) / 'benchmarks/result.json'
+            stdout, stderr = io.StringIO(), io.StringIO()
+            with mock.patch.object(bench, 'read_key', return_value='synthetic-key'), \
+                 mock.patch.object(bench.Client, 'evaluate', side_effect=RuntimeError('private-body')) as call, \
+                 contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+                result = bench.main(['--connect', '--output', str(output)])
+            self.assertEqual(result, 1)
+            self.assertEqual(call.call_count, 1)
+            self.assertEqual(json.loads(output.read_text())['summary']['jev']['errors'], 1)
+            self.assertNotIn('private-body', stdout.getvalue() + stderr.getvalue() + output.read_text())
+            self.assertEqual(output.stat().st_mode & 0o777, 0o600)
+
+    def test_openai_transport_does_not_follow_redirect_or_echo_response_body(self):
+        response = mock.Mock(status=302, read=mock.Mock(return_value=b'private-body'))
+        with mock.patch.object(bench.http.client, 'HTTPSConnection') as connection:
+            connection.return_value.getresponse.return_value = response
+            with self.assertRaisesRegex(RuntimeError, 'body withheld'):
+                bench.OpenAIClient('synthetic-key', 1).evaluate({})
+            connection.assert_called_once_with('api.openai.com', timeout=1)
+            connection.return_value.request.assert_called_once()
+            connection.return_value.close.assert_called_once()
 
     def test_benchmark_defaults_are_offline_and_do_not_read_keys(self):
         with mock.patch.object(bench, 'read_key') as key, mock.patch.object(bench, 'Client') as client, contextlib.redirect_stdout(io.StringIO()):

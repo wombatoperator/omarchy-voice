@@ -68,7 +68,7 @@ def decide(response, candidates, threshold):
         if selected not in candidates or set(probs) != set(candidates):
             raise ValueError("Unexpected candidates")
         values = [probability(v) for v in probs.values()]
-        if not math.isclose(sum(values), 1, abs_tol=.01) or probs[selected] < max(values):
+        if not math.isclose(sum(values), 1, abs_tol=.01 + 1e-9) or probs[selected] < max(values):
             raise ValueError("Invalid distribution")
         confidence = probability(choice["confidence"])
         eligible = probability(supported["noul"])

@@ -27,8 +27,9 @@ def read_key(path, name):
     return key
 
 
-def openai_payload(request, inventory, model):
-    body = nav.payload(request, inventory)
+def openai_payload(request, inventory, model, representation='slots'):
+    body = (nav.candidate_payload(request, inventory) if representation == 'candidates'
+            else nav.payload(request, inventory))
     properties = {name: {'type': 'string', 'enum': list(question['criteria'])}
                   for name, question in body['questions'].items() if question['type'] == 'choice'}
     return {'model': model, 'store': False, 'reasoning': {'effort': 'low'},
@@ -65,14 +66,19 @@ class OpenAIClient(Client):
             raise
 
 
-def openai_decision(response, inventory):
+def openai_decision(response, inventory, representation='slots'):
     calls = [x for x in response.get('output', []) if x.get('type') == 'function_call']
     if len(calls) != 1 or calls[0].get('name') != 'select_navigation':
         raise ValueError('Missing complete selection')
     selected = json.loads(calls[0]['arguments'])
-    questions = {k: v for k, v in nav.questions(inventory).items() if v['type'] == 'choice'}
+    body = (nav.candidate_payload('validation', inventory) if representation == 'candidates'
+            else nav.payload('validation', inventory))
+    questions = {k: v for k, v in body['questions'].items() if v['type'] == 'choice'}
     if set(selected) != set(questions) or any(selected[k] not in q['criteria'] for k, q in questions.items()):
         raise ValueError('Unknown selection')
+    if representation == 'candidates':
+        key = selected['selection']
+        selected = nav.candidates(inventory)[key][0] if key != nav.FALLBACK else {'action': nav.FALLBACK}
     call = nav.compile_selection(selected, inventory)
     return {'valid': True, 'accepted': call is not None, 'selection': selected, 'call': call}
 
@@ -106,7 +112,8 @@ def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--connect', action='store_true')
     parser.add_argument('--provider', choices=('jev', 'openai', 'both'), default='jev')
-    parser.add_argument('--split', choices=('development', 'held_out', 'all'), default='development')
+    parser.add_argument('--representation', choices=('slots', 'candidates'), default='slots')
+    parser.add_argument('--split', choices=('development', 'held_out', 'confirmation', 'all'), default='development')
     parser.add_argument('--limit', type=int, default=100)
     parser.add_argument('--repeat', type=int, default=1)
     parser.add_argument('--threshold', type=float, default=.9)
@@ -150,13 +157,15 @@ def main(argv=None):
                         for provider in order:
                             started = time.perf_counter()
                             try:
-                                body = (nav.payload(case['request'], INVENTORY, args.jev_model) if provider == 'jev'
-                                        else openai_payload(case['request'], INVENTORY, args.openai_model))
+                                payload_fn = nav.candidate_payload if args.representation == 'candidates' else nav.payload
+                                body = (payload_fn(case['request'], INVENTORY, args.jev_model) if provider == 'jev'
+                                        else openai_payload(case['request'], INVENTORY, args.openai_model, args.representation))
                                 if len(json.dumps(body).encode()) > 60000:
                                     raise ValueError('Request exceeds trial input bound')
                                 response, elapsed, cold = clients[provider].evaluate(body)
-                                decision = (nav.decide(response, INVENTORY, args.threshold) if provider == 'jev'
-                                            else openai_decision(response, INVENTORY))
+                                decide_fn = nav.decide_candidate if args.representation == 'candidates' else nav.decide
+                                decision = (decide_fn(response, INVENTORY, args.threshold) if provider == 'jev'
+                                            else openai_decision(response, INVENTORY, args.representation))
                                 if not decision['valid']:
                                     raise ValueError('Malformed provider decision')
                                 usage = response.get('usage') or {}
@@ -186,6 +195,7 @@ def main(argv=None):
                 totals = summary(rows)
                 json.dump({'summary': totals, 'rows': rows, 'threshold': args.threshold,
                            'models': {'jev': args.jev_model, 'openai': args.openai_model},
+                           'representation': args.representation,
                            'note': 'Synthetic decision-only trial. No speech, desktop execution, or fallback time.'}, output, indent=2)
             print(json.dumps(totals, indent=2))
             return int(any(not row['valid'] for row in rows))

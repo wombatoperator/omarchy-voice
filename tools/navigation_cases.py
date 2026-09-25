@@ -73,4 +73,50 @@ def cases():
         "Move the browser to workspace two", "Do not close this window", "Explain how to switch workspaces",
     ):
         add(request, "fallback", "held_out")
+    # Fresh confirmation set: added after the first two representations were calibrated.
+    for request, action, slots in (
+        ("Please take me to workspace seven", "workspace", {"workspace": "7"}),
+        ("Send the active window to desktop nine and switch there too", "move_workspace", {"workspace": "9"}),
+        ("Leave me here and put the current window on workspace five", "send_workspace", {"workspace": "5"}),
+        ("I want the Example documentation window in front", "focus_window", {"window": "w1"}),
+        ("Give focus to the Synthetic project editor window", "focus_window", {"window": "w2"}),
+        ("Select the neighboring window below this one", "focus_direction", {"direction": "down"}),
+        ("Trade positions with the neighboring window on the left", "swap_direction", {"direction": "left"}),
+        ("Take focus to my right-hand display", "focus_monitor", {"monitor": "m1"}),
+        ("Transfer the current workspace to the right display", "move_workspace_monitor", {"monitor": "m1"}),
+        ("Go forward one workspace", "workspace_next", {}),
+        ("Step back one adjacent workspace", "workspace_previous", {}),
+        ("Return to the last workspace I visited", "workspace_back", {}),
+        ("Toggle scratchpad visibility for me", "scratchpad", {}),
+        ("Put the current window away in scratchpad", "send_scratchpad", {}),
+        ("Close the currently focused terminal", "close", {}),
+        ("Switch focus to the next window", "cycle_next", {}),
+        ("Switch focus to the previous window", "cycle_previous", {}),
+        ("Bring this window to the very top", "raise", {}),
+        ("Toggle fullscreen mode for the active window", "fullscreen", {}),
+        ("Toggle floating mode for this window", "float", {}),
+        ("Change the current window split orientation", "split", {}),
+        ("Detach the current window from its group", "group_leave", {}),
+        ("Select window number four within this group", "group_index", {"group_index": "4"}),
+        ("Move the active window into the neighboring group above it", "group_join", {"direction": "up"}),
+        ("Launch Example Notes", "launch_app", {"app": "a2"}),
+        ("Toggle the desktop sound panel", "panel_audio", {}),
+        ("Toggle the wireless network panel", "panel_network", {}),
+        ("Bring up a new default terminal", "terminal", {}),
+        ("Show the file manager", "files", {}),
+        ("Display the keyboard bindings menu", "keybindings", {}),
+        ("Show the notification history panel", "notification_history", {}),
+        ("Restore the saved width of this window", "restore_width", {}),
+    ):
+        add(request, action, "confirmation", **slots)
+    for request in (
+        "Which display would be best for editing?", "Read the text in the terminal",
+        "Take me to workspace two and then workspace five", "Close the editor and focus the browser",
+        "If this is the terminal, switch to workspace three", "Please leave this window open",
+        "Make the browser window float", "Switch to desktop ninety-nine", "Focus the chat window",
+        "Open a terminal running an update command", "Resize the window to 800 pixels wide",
+        "Bring up a useful website about window management", "Switch off fullscreen mode",
+        "Put that thing over there", "Explain the scratchpad", "Open Example Notes and write a shopping list",
+    ):
+        add(request, "fallback", "confirmation")
     return rows
