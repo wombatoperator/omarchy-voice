@@ -101,3 +101,83 @@ A background task marked `running` may be installing dependencies or awaiting a
 model response. Inspect its phase and command receipts. A `blocked` task may already
 have useful artifacts. Inspect them before resuming, and do not claim completion
 until the task's acceptance checks have run. See [task workers](task-workers.md).
+
+## Jev desktop navigation trials
+
+`tools/bench_navigation.py` compares a pinned Jev decision model with the configured
+trial OpenAI model on synthetic Omarchy requests. It never captures the desktop,
+records audio, executes tools, or changes the running voice service. The default
+is offline validation; network usage requires `--connect`.
+
+The experimental catalogue in `src/omarchy_voice/navigation.py` covers 61 action
+variants: numbered workspace switching, moving the focused window with or without
+following, workspace history, named-window and directional focus, window cycling
+and swapping, monitor focus and workspace movement, scratchpad, fullscreen and
+floating toggles, split/pseudo layouts, groups, packaged resize steps, installed
+application launches, default applications, panels, and navigation menus. It uses
+existing tool names and literal command templates; Jev selects only action and
+argument labels. Dispatcher and command availability are explicit inputs, not
+assumed from a model's knowledge. Arbitrary application IDs and window addresses
+from model output are never interpolated into commands.
+
+This is a decision experiment, **not an enabled voice backend**. Workspaces 1–10,
+group positions 1–5, and the packaged resize increments are currently enumerated.
+Named nonfocused window mutations, arbitrary dimensions, free text, URLs,
+conditional/compound requests, and interpretive tasks defer to GPT. A request to
+set a particular fullscreen/floating state cannot safely become a toggle without
+state evidence. Missing or uncertain arguments also defer. Every question runs
+independently; the action and its required arguments must each pass the configured
+confidence threshold. Confidence does not establish permission or correctness.
+
+Run from the repository root:
+
+```sh
+# Validate the catalogue and development case count without reading credentials.
+python3 tools/bench_navigation.py
+
+# Explicit paid calls using only synthetic fixtures; no desktop operations.
+python3 tools/bench_navigation.py --connect --provider jev \
+  --split development --env-file .env \
+  --output benchmarks/jev/development.json
+
+# Interleave providers on separate paraphrases and requests that should defer.
+python3 tools/bench_navigation.py --connect --provider both \
+  --split held_out --repeat 2 --env-file .env \
+  --output benchmarks/jev/comparison.json
+```
+
+The key names default to `JEV_API_KEY` and `OPENAI_API_KEY`; `--jev-key-env` can
+select `TYPESAFE_API_KEY`. Only those keys are read from the specified file, which
+is parsed as data and never executed. Results require a new file under ignored
+`benchmarks/` or `docs/private/`, with owner-only file permissions. Do not commit or
+upload reports. No key, request text, or provider error body is printed. Requests
+use fixed HTTPS provider destinations, reusable connections, bounded responses,
+and no automatic retries. A provider failure stops the run and retains partial
+results. A run is limited to 200 requests, with a 15-second per-request timeout.
+This bounds calls, not account-wide spend; backend model prices vary.
+
+The report separates raw selection accuracy, accepted decisions, wrong accepted
+actions, eligible commands correctly handled, and HTTP median/p95 latency. Unused
+argument slots do not affect correctness or acceptance. Cold and reused-connection
+samples are reported separately. Development cases intentionally cover catalogue
+wording; held-out cases use separate paraphrases and rejection scenarios. Once a
+held-out set informs prompt changes, treat it as development data and create a
+new evaluation set before claiming generalization.
+
+The OpenAI comparison uses one Responses decision with low reasoning, standard
+processing, the same inventory and action/argument choices, and forced structured
+function output. It is not the existing Live session's end-to-end latency. Neither
+provider's measurements include speech completion, delegation, desktop execution,
+verification, fallback work, or spoken confirmation. Faster decision requests alone
+do not prove that the complete voice workflow is faster.
+
+Before enabling execution, integrate through the existing Executor policy and
+confirmation path, recheck target identity and active focus, discard stale or
+cancelled decisions, and verify action outcomes. GPT-Live client delegation can
+route supported commands to this path and interpretive work to GPT; the trial does
+not alter the existing managed Responses delegation. Avoid inserting Jev ahead of
+all the same OpenAI calls, which adds a round trip rather than replacing one.
+
+References: [TypeSafe models](https://docs.typesafe.ai/models),
+[TypeSafe function selection](https://docs.typesafe.ai/cookbooks/function_calling),
+and [GPT-Live delegation](https://developers.openai.com/api/docs/guides/live-delegation).
