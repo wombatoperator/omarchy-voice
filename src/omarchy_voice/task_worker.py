@@ -444,7 +444,8 @@ class Worker:
         schema.write_text(json.dumps(RESULT_SCHEMA))
         prompt.write_text(PROMPT.replace("cwd /workspace", "cwd " + str(self.workspace)) +
                           "\nYou are the external Codex adapter: use your native file and shell tools. "
-                          "Return the required JSON result instead of calling finish. Check argv vectors "
+                          "Return the required JSON result instead of calling finish. Number each check by its "
+                          "zero-based criterion index: the first acceptance criterion is 0. Check argv vectors "
                           "will be re-run in /workspace in OMA's isolated verifier. Keep those paths relative.\n" + self.initial_prompt())
         command = [executable, "exec", "--ignore-user-config", "--ephemeral", "--skip-git-repo-check",
                    "--sandbox", "workspace-write", "-c", 'approval_policy="never"',

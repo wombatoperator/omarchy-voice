@@ -114,7 +114,9 @@ class Camera:
         capture = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-nostdin", "-f", "v4l2",
                    "-input_format", s["input_format"], "-video_size", f'{s["width"]}x{s["height"]}',
                    "-framerate", str(s["fps"]), "-i", s["device"], "-an"]
-        capture += ["-c:v", "copy"] if s["input_format"] == "mjpeg" else ["-c:v", "mjpeg", "-q:v", "3", "-threads", "1"]
+        # Non-MJPEG sources (NV12/YUYV) must be converted explicitly: FFmpeg 9's
+        # mjpeg encoder emits black frames when handed NV12 straight from v4l2.
+        capture += ["-c:v", "copy"] if s["input_format"] == "mjpeg" else ["-pix_fmt", "yuvj420p", "-c:v", "mjpeg", "-q:v", "3", "-threads", "1"]
         capture += ["-f", "mpjpeg", "pipe:1"]
         try:
             self.capture = await asyncio.create_subprocess_exec(*capture, stdout=asyncio.subprocess.PIPE,
@@ -133,6 +135,7 @@ class Camera:
             await asyncio.wait_for(self.ready.wait(), 8)
             if not self.active or not self.frame:
                 raise RuntimeError(self.failure or "Camera or preview failed to open")
+            self.opened_at = time.monotonic()
             self.report("vision_capture_started", startup_ms=round((time.monotonic() - began) * 1000, 1),
                         capture_pid=self.capture.pid, preview_pid=self.preview.pid)
         except BaseException:
@@ -185,6 +188,13 @@ class Camera:
 
     async def fresh(self):
         # Wait for a frame captured AFTER this request, not a cached camera image.
+        # Some cameras (and VM camera bridges) deliver black frames while their
+        # exposure settles; `warmup_seconds` skips that window after opening.
+        warm_until = getattr(self, "opened_at", 0) + float(self.settings.get("warmup_seconds") or 0)
+        while time.monotonic() < warm_until:
+            if not self.active:
+                raise RuntimeError(self.failure or "Camera is off")
+            await asyncio.sleep(.01)
         sequence = self.sequence
         deadline = time.monotonic() + 2
         while self.sequence == sequence:
