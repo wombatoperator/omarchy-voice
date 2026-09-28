@@ -90,7 +90,8 @@ def validate_settings(s):
                             ("max_output_tokens", 128, 4096), ("max_requests", 1, 200)):
         if type(s[name]) is not int or not low <= s[name] <= high:
             raise ValueError(f"vision.{name} must be an integer from {low} to {high}")
-    for name, low, high in (("timeout_seconds", 2, 120), ("idle_seconds", 10, 3600), ("max_session_seconds", 30, 7200)):
+    for name, low, high in (("timeout_seconds", 2, 120), ("idle_seconds", 10, 3600), ("max_session_seconds", 30, 7200),
+                            ("warmup_seconds", 0, 10)):
         if type(s[name]) not in (int, float) or not math.isfinite(s[name]) or not low <= s[name] <= high:
             raise ValueError(f"vision.{name} must be between {low} and {high}")
     for name, low, high in (("crop_percent", 0, 70), ("sharpen", 0, 1.5)):

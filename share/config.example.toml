@@ -35,6 +35,7 @@ image_width = 1920                 # lower to reduce uploads; preserves aspect r
 crop_percent = 30.0                # centered: 15% off each edge, keep central 70% (~1.43x zoom)
 sharpen = 0.4                      # gentle sharpening; 0 disables (range 0–1.5)
 idle_seconds = 90
+warmup_seconds = 0.0               # skip frames this long after opening; VM/USB cameras often start black (try 2.0)
 max_session_seconds = 600
 max_requests = 20                  # no automatic background analysis or retries
 

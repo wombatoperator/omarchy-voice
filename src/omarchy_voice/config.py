@@ -165,6 +165,7 @@ class Config:
     vision_crop_percent: float = 30.0  # remove 15% per edge; keep the central 70%
     vision_sharpen: float = 0.4  # gentle luminance sharpening; 0 disables
     vision_idle_seconds: float = 90.0
+    vision_warmup_seconds: float = 0.0  # Discard frames this long after the camera opens (auto-exposure / bridge warm-up).
     vision_max_session_seconds: float = 600.0
     vision_max_requests: int = 20
 
