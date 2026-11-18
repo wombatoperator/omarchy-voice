@@ -65,6 +65,9 @@ METER_SLICE = 0.05
 # decision to barge in is made here, the completion happens there.
 BENIGN_ERRORS = {"response_cancel_not_active", "item_not_found"}
 
+# Sent just before the server closes a session at its 60-minute cap.
+SESSION_EXPIRED = "session_expired"
+
 # A response can come back `failed` because the org ran out of tokens-per-minute
 # rather than because anything about the request was wrong, and the fix is to
 # wait and ask again. Retried this many times per user turn before giving up and
@@ -452,6 +455,9 @@ class RealtimeSession:
         self._user_quit = False
         # Set when the websocket dies on us rather than being closed on purpose.
         self._dropped = False
+        # Set when the server ended the session at its 60-minute cap, so the
+        # reconnect that follows is routine rather than a fault.
+        self._expired = False
         self._exit_code = 0
 
     # -- plumbing -----------------------------------------------------------
@@ -919,6 +925,13 @@ class RealtimeSession:
                 # real errors are not lost in the noise.
                 self.feedback.log(f"note    {message}")
                 return
+            if error.get("code") == SESSION_EXPIRED:
+                # The server caps every realtime session at 60 minutes, so a
+                # healthy daemon sees this once an hour and reconnects a few
+                # seconds later. Not a fault: no red orb, no notification.
+                self._expired = True
+                self.feedback.log(f"note    {message}")
+                return
             self.feedback.log(f"error   {message}")
             self.feedback.state("error", message)
             self.feedback.notify("Voice error", message, urgency="normal")
@@ -1189,6 +1202,7 @@ class RealtimeSession:
         attempt = 0
         while not self._user_quit:
             self._dropped = False
+            self._expired = False
             self._stop.clear()
             connected_at = time.monotonic()
             try:
@@ -1238,7 +1252,10 @@ class RealtimeSession:
                 return
             was_listening, self.active = self.active, False
             self._active_event.clear()
-            self.feedback.state("error", f"reconnecting ({attempt}/{RECONNECT_ATTEMPTS})")
+            if not self._expired:
+                # An hourly expiry reconnects in a couple of seconds; showing it
+                # as an error would turn the orb red for nothing.
+                self.feedback.state("error", f"reconnecting ({attempt}/{RECONNECT_ATTEMPTS})")
             self.feedback.log(f"retry   reconnecting in {delay:.0f}s "
                               f"({attempt}/{RECONNECT_ATTEMPTS})")
             await asyncio.sleep(delay)

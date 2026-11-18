@@ -253,6 +253,28 @@ class RealtimeSessionTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("response.cancel", kinds)
         self.assertNotIn("conversation.item.truncate", kinds)
 
+    async def test_session_expiry_is_not_reported_as_an_error(self):
+        """The server ends every session at 60 minutes; a healthy daemon sees
+        this hourly, so it must not turn the orb red or fire a notification."""
+        with mock.patch.object(self.session.feedback, "notify") as notify, \
+             mock.patch.object(self.session.feedback, "state") as state:
+            await self.session._on_event({"type": "error", "error": {
+                "code": "session_expired",
+                "message": "Your session hit the maximum duration of 60 minutes."}})
+        notify.assert_not_called()
+        state.assert_not_called()
+        self.assertTrue(self.session._expired)
+        log = (Path(self.tmp.name) / "session.log").read_text()
+        self.assertIn("note    session_expired", log)
+        self.assertNotIn("error", log.replace("session_expired", ""))
+
+    async def test_other_errors_still_notify(self):
+        with mock.patch.object(self.session.feedback, "notify") as notify:
+            await self.session._on_event({"type": "error", "error": {
+                "code": "invalid_request_error", "message": "bad"}})
+        notify.assert_called_once()
+        self.assertFalse(self.session._expired)
+
     async def test_audio_bytes_reset_between_items(self):
         """Truncation is an offset into one item, so bytes cannot accumulate.
 
@@ -653,6 +675,41 @@ class ReconnectTests(unittest.IsolatedAsyncioTestCase):
         # Every retry is the first retry: none of them ever reaches (2/6).
         self.assertIn("(1/6)", log)
         self.assertNotIn("(2/6)", log)
+
+    async def test_reconnect_after_expiry_never_shows_error(self):
+        sessions = []
+
+        async def expire_once(url, headers):
+            sessions.append(1)
+            if len(sessions) == 1:
+                self.session._expired = True
+                self.session._dropped = True
+            else:
+                self.session._user_quit = True
+
+        states = []
+        with mock.patch.object(self.session.feedback, "state",
+                               side_effect=lambda s, t="": states.append(s)):
+            log = await self.serve_with(expire_once)
+        self.assertEqual(len(sessions), 2)              # it did reconnect
+        self.assertIn("reconnecting", log)
+        self.assertNotIn("error", states)
+
+    async def test_reconnect_after_a_real_drop_still_shows_error(self):
+        sessions = []
+
+        async def drop_once(url, headers):
+            sessions.append(1)
+            if len(sessions) == 1:
+                self.session._dropped = True
+            else:
+                self.session._user_quit = True
+
+        states = []
+        with mock.patch.object(self.session.feedback, "state",
+                               side_effect=lambda s, t="": states.append(s)):
+            await self.serve_with(drop_once)
+        self.assertIn("error", states)
 
     async def test_a_recovered_reconnect_stops_saying_error(self):
         """Muted is the resting state, and nothing else writes the status, so
